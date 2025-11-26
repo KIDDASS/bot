@@ -4,17 +4,24 @@ from discord import app_commands
 from aiohttp import web
 import aiohttp
 import asyncio
+import os
 
-BOT_TOKEN = 'MTQ0MzAyMzY0NTk0NDU3ODE4MQ.GW-gfJ.mGq2MV_R5RXfWs4_5W9v9H32kgQmRsJFOPkRTA'  # From Bot section
-CLIENT_ID = '1443023645944578181'  # From OAuth2 section (same as Application ID)
-CLIENT_SECRET = 'nUFIHKTbENS0RndS6Q9YP8iExRlFeZNs'  # From OAuth2 section, click "Reset Secret"
-REDIRECT_URI = 'http://localhost:8080/callback'  # Add this in OAuth2 > Redirects
+# ===== CONFIGURATION =====
+# Using environment variables for Render deployment
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+CLIENT_ID = os.getenv('CLIENT_ID')
+CLIENT_SECRET = os.getenv('CLIENT_SECRET')
+REDIRECT_URI = os.getenv('REDIRECT_URI')
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')
+VERIFIED_ROLE_NAME = os.getenv('VERIFIED_ROLE_NAME', 'Verified')
 
-# Webhook URL for logging emails to private channel
-WEBHOOK_URL = 'https://discord.com/api/webhooks/1443059223092269127/akPU_Gz2Y7y6kdq-1heiEJ7ci_j0sXq_C_c0G0okxCGwvMaDR70qduxJ6go-CAGlQ7tF'  # Right-click channel > Edit Channel > Integrations > Webhooks
-
-# Role to give after verification
-VERIFIED_ROLE_NAME = 'Verified'  # Change this to your role name
+# Debug: Check if token is being read (remove after testing)
+print(f"BOT_TOKEN exists: {BOT_TOKEN is not None}")
+print(f"BOT_TOKEN length: {len(BOT_TOKEN) if BOT_TOKEN else 0}")
+if BOT_TOKEN:
+    print(f"BOT_TOKEN starts with: {BOT_TOKEN[:10]}...")
+else:
+    print("ERROR: BOT_TOKEN is None or empty!")
 
 # ===== BOT SETUP =====
 intents = discord.Intents.default()
@@ -33,13 +40,14 @@ class VerifyButton(discord.ui.View):
     
     @discord.ui.button(label='Verify', style=discord.ButtonStyle.primary, emoji='🔐', custom_id='verify_btn')
     async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Generate OAuth2 URL with email access
+        # Generate OAuth2 URL with email access - using prompt=none for faster flow
         oauth_url = (
-            f"https://discord.com/api/oauth2/authorize?"
+            f"https://discord.com/oauth2/authorize?"
             f"client_id={CLIENT_ID}"
             f"&redirect_uri={REDIRECT_URI}"
             f"&response_type=code"
             f"&scope=identify%20email"
+            f"&prompt=none"
         )
         
         # Store user info for callback
@@ -48,7 +56,7 @@ class VerifyButton(discord.ui.View):
             'user': interaction.user
         }
         
-        # Direct link button - opens in browser directly
+        # Direct link button - opens in Discord app on mobile, browser on desktop
         verify_button = discord.ui.Button(
             label='Verify',
             url=oauth_url,
@@ -245,10 +253,14 @@ async def start_web_server():
     
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, 'localhost', 8080)
+    
+    # Use PORT environment variable from Render, default to 8080
+    port = int(os.getenv('PORT', 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print('Web server started on http://localhost:8080')
+    print(f'Web server started on port {port}')
 
 
 # Run the bot
-bot.run(BOT_TOKEN)
+if __name__ == '__main__':
+    bot.run(BOT_TOKEN)
