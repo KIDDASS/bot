@@ -38,8 +38,23 @@ class VerifyButton(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
     
-    @discord.ui.button(label='Verify', style=discord.ButtonStyle.primary, emoji='', custom_id='verify_btn')
+    @discord.ui.button(label='Verify', style=discord.ButtonStyle.primary, custom_id='verify_btn')
     async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Check if user already has the verified role
+        verified_role = discord.utils.get(interaction.guild.roles, name=VERIFIED_ROLE_NAME)
+        
+        if verified_role and verified_role in interaction.user.roles:
+            # User already has the verified role
+            embed = discord.Embed(
+                title="Already Verified",
+                description="You already have the verified role.",
+                color=discord.Color.green()
+            )
+            embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
         # Generate OAuth2 URL with email access - using prompt=none for faster flow
         oauth_url = (
             f"https://discord.com/oauth2/authorize?"
@@ -60,8 +75,7 @@ class VerifyButton(discord.ui.View):
         verify_button = discord.ui.Button(
             label='Verify',
             url=oauth_url,
-            style=discord.ButtonStyle.link,
-            emoji=''
+            style=discord.ButtonStyle.link
         )
         
         view = discord.ui.View()
@@ -99,7 +113,7 @@ async def setup_verify(interaction: discord.Interaction):
     embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
     
     await interaction.channel.send(embed=embed, view=VerifyButton())
-    await interaction.response.send_message(' Verification message sent!', ephemeral=True)
+    await interaction.response.send_message('Verification message sent successfully.', ephemeral=True)
 
 
 # ===== WEB SERVER FOR OAUTH CALLBACK =====
@@ -107,7 +121,7 @@ async def handle_callback(request):
     code = request.query.get('code')
     
     if not code:
-        return web.Response(text=' No authorization code provided!', content_type='text/html')
+        return web.Response(text='Error: No authorization code provided.', content_type='text/html')
     
     try:
         # Exchange code for access token
@@ -127,7 +141,7 @@ async def handle_callback(request):
                 token_data = await resp.json()
             
             if 'access_token' not in token_data:
-                return web.Response(text=' Failed to get access token!', content_type='text/html')
+                return web.Response(text='Error: Failed to get access token.', content_type='text/html')
             
             access_token = token_data['access_token']
             
@@ -143,7 +157,7 @@ async def handle_callback(request):
         # Check if user is in pending verifications
         if user_id not in pending_verifications:
             return web.Response(
-                text='❌ Verification session expired. Please click the verify button again.',
+                text='Verification session expired. Please click the verify button again.',
                 content_type='text/html'
             )
         
@@ -152,11 +166,11 @@ async def handle_callback(request):
         guild = bot.get_guild(guild_id)
         
         if not guild:
-            return web.Response(text=' Server not found!', content_type='text/html')
+            return web.Response(text='Error: Server not found.', content_type='text/html')
         
         member = guild.get_member(user_id)
         if not member:
-            return web.Response(text=' Member not found in server!', content_type='text/html')
+            return web.Response(text='Error: Member not found in server.', content_type='text/html')
         
         # Find or create verified role
         verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
@@ -168,6 +182,21 @@ async def handle_callback(request):
                 reason='Verification role'
             )
         
+        # Check if user already has the role (double-check)
+        if verified_role in member.roles:
+            return web.Response(
+                text=f'''
+                <html>
+                    <body style="font-family: Arial; text-align: center; padding: 50px; background: #2f3136; color: white;">
+                        <h1>Already Verified</h1>
+                        <p>You already have the verified role, <strong>{username}</strong>.</p>
+                        <p>You can close this window and return to Discord.</p>
+                    </body>
+                </html>
+                ''',
+                content_type='text/html'
+            )
+        
         # Give role to member
         await member.add_roles(verified_role)
         
@@ -176,26 +205,26 @@ async def handle_callback(request):
             try:
                 webhook_embed = {
                     "embeds": [{
-                        "title": " New Verification",
+                        "title": "New Verification",
                         "color": 0x57F287,  # Green color
                         "fields": [
                             {
-                                "name": " User",
+                                "name": "User",
                                 "value": f"{username} (<@{user_id}>)",
                                 "inline": True
                             },
                             {
-                                "name": " User ID",
+                                "name": "User ID",
                                 "value": str(user_id),
                                 "inline": True
                             },
                             {
-                                "name": " Email",
+                                "name": "Email",
                                 "value": email,
                                 "inline": False
                             },
                             {
-                                "name": " Server",
+                                "name": "Server",
                                 "value": guild.name,
                                 "inline": True
                             }
@@ -215,7 +244,7 @@ async def handle_callback(request):
             embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
             
             view = discord.ui.View()
-            view.add_item(discord.ui.Button(label='Verify', emoji='', style=discord.ButtonStyle.success, disabled=True))
+            view.add_item(discord.ui.Button(label='Verify', style=discord.ButtonStyle.success, disabled=True))
             
             await member.send(embed=embed, view=view)
         except:
@@ -225,14 +254,14 @@ async def handle_callback(request):
         del pending_verifications[user_id]
         
         # Log verification
-        print(f' Verified: {username} ({user_id}) - Email: {email}')
+        print(f'Verified: {username} ({user_id}) - Email: {email}')
         
         return web.Response(
             text=f'''
             <html>
                 <body style="font-family: Arial; text-align: center; padding: 50px; background: #2f3136; color: white;">
-                    <h1> Verification Successful!</h1>
-                    <p>Welcome, <strong>{username}</strong>!</p>
+                    <h1>Verification Successful</h1>
+                    <p>Welcome, <strong>{username}</strong>.</p>
                     <p>Your email <strong>{email}</strong> has been verified.</p>
                     <p>You can now close this window and return to Discord.</p>
                 </body>
@@ -243,7 +272,7 @@ async def handle_callback(request):
         
     except Exception as e:
         print(f'Error in callback: {e}')
-        return web.Response(text=f' Error: {str(e)}', content_type='text/html')
+        return web.Response(text=f'Error: {str(e)}', content_type='text/html')
 
 
 async def start_web_server():
