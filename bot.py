@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import json
 from pathlib import Path
+import sqlite3
+from pathlib import Path
 
 # ===== CONFIGURATION =====
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -52,30 +54,79 @@ vc_tracking = defaultdict(lambda: {
 })
 
 # ===== VC DATA FUNCTIONS =====
-def load_vc_data():
-    global vc_tracking
-    if vc_data_file.exists():
-        try:
-            with open(vc_data_file, 'r') as f:
-                data = json.load(f)
-                for user_id, user_data in data.items():
-                    vc_tracking[int(user_id)] = user_data
-            print(f"✅ Loaded VC data for {len(vc_tracking)} users")
-        except Exception as e:
-            print(f"❌ Error loading VC data: {e}")
+DB_FILE = '/opt/render/project/src/vc_data.db'  # Render's persistent path
 
-def save_vc_data():
-    try:
-        with open(vc_data_file, 'w') as f:
-            json.dump(dict(vc_tracking), f, indent=2)
-    except Exception as e:
-        print(f"❌ Error saving VC data: {e}")
+def init_db():
+    """Initialize SQLite database"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS vc_users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            avatar TEXT,
+            total_seconds INTEGER DEFAULT 0,
+            current_session_start REAL,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    print("✅ Database initialized")
 
-async def auto_save_vc_data():
-    while True:
-        await asyncio.sleep(300)
-        save_vc_data()
-        print("💾 VC data auto-saved")
+def get_user_data(user_id):
+    """Get user VC data"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    c.execute('SELECT * FROM vc_users WHERE user_id = ?', (user_id,))
+    result = c.fetchone()
+    
+    conn.close()
+    
+    if result:
+        return {
+            'user_id': result[0],
+            'username': result[1],
+            'avatar': result[2],
+            'total_seconds': result[3],
+            'current_session_start': result[4]
+        }
+    return None
+
+def save_user_data(user_id, username, avatar, total_seconds, session_start):
+    """Save/update user VC data"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    c.execute('''
+        INSERT OR REPLACE INTO vc_users 
+        (user_id, username, avatar, total_seconds, current_session_start, last_updated)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ''', (user_id, username, avatar, total_seconds, session_start))
+    
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    """Get all users with VC data"""
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    
+    c.execute('SELECT * FROM vc_users ORDER BY total_seconds DESC')
+    results = c.fetchall()
+    
+    conn.close()
+    
+    return [{
+        'user_id': row[0],
+        'username': row[1],
+        'avatar': row[2],
+        'total_seconds': row[3],
+        'current_session_start': row[4]
+    } for row in results]
 
 # ===== VC EVENT HANDLERS =====
 @bot.event
@@ -84,36 +135,59 @@ async def on_voice_state_update(member, before, after):
         return
     
     user_id = member.id
-    current_time = datetime.utcnow()
+    current_time = datetime.utcnow().timestamp()
     
     # User joined VC
     if before.channel is None and after.channel is not None:
-        vc_tracking[user_id]['current_session_start'] = current_time.isoformat()
-        vc_tracking[user_id]['username'] = str(member)
-        vc_tracking[user_id]['avatar'] = str(member.display_avatar.url)
+        user_data = get_user_data(user_id)
+        
+        if user_data:
+            total_seconds = user_data['total_seconds']
+        else:
+            total_seconds = 0
+        
+        save_user_data(
+            user_id,
+            str(member),
+            str(member.display_avatar.url),
+            total_seconds,
+            current_time
+        )
         print(f"🎤 {member} joined VC")
     
     # User left VC
     elif before.channel is not None and after.channel is None:
-        if vc_tracking[user_id]['current_session_start']:
-            start_time = datetime.fromisoformat(vc_tracking[user_id]['current_session_start'])
-            session_duration = (current_time - start_time).total_seconds()
-            vc_tracking[user_id]['total_time'] += session_duration
-            vc_tracking[user_id]['current_session_start'] = None
-            save_vc_data()
-            print(f"👋 {member} left VC after {session_duration/60:.1f} minutes")
+        user_data = get_user_data(user_id)
+        
+        if user_data and user_data['current_session_start']:
+            session_duration = int(current_time - user_data['current_session_start'])
+            new_total = user_data['total_seconds'] + session_duration
+            
+            save_user_data(
+                user_id,
+                user_data['username'],
+                user_data['avatar'],
+                new_total,
+                None
+            )
+            print(f"👋 {member} left VC. Session: {session_duration}s, Total: {new_total}s")
     
     # User switched channels
-    elif before.channel != after.channel and before.channel is not None and after.channel is not None:
-        if vc_tracking[user_id]['current_session_start']:
-            start_time = datetime.fromisoformat(vc_tracking[user_id]['current_session_start'])
-            session_duration = (current_time - start_time).total_seconds()
-            vc_tracking[user_id]['total_time'] += session_duration
+    elif before.channel != after.channel:
+        user_data = get_user_data(user_id)
         
-        vc_tracking[user_id]['current_session_start'] = current_time.isoformat()
-        vc_tracking[user_id]['username'] = str(member)
-        vc_tracking[user_id]['avatar'] = str(member.display_avatar.url)
-        save_vc_data()
+        if user_data and user_data['current_session_start']:
+            session_duration = int(current_time - user_data['current_session_start'])
+            new_total = user_data['total_seconds'] + session_duration
+            
+            save_user_data(
+                user_id,
+                str(member),
+                str(member.display_avatar.url),
+                new_total,
+                current_time
+            )
+            print(f"🔄 {member} switched channels")
 
 # ===== VC COMMANDS =====
 @bot.tree.command(name='vcstats', description='View voice channel statistics')
@@ -527,46 +601,50 @@ async def security_settings(interaction: discord.Interaction):
 
 # ===== WEB API HANDLERS =====
 async def handle_vc_leaderboard(request):
-    """API endpoint for leaderboard data"""
-    leaderboard_data = []
-    for user_id, data in vc_tracking.items():
-        total_seconds = data['total_time']
-        
-        if data['current_session_start']:
-            start_time = datetime.fromisoformat(data['current_session_start'])
-            current_session = (datetime.utcnow() - start_time).total_seconds()
-            total_seconds += current_session
-        
-        if total_seconds > 0:
-            leaderboard_data.append({
-                'user_id': str(user_id),
-                'username': data.get('username', 'Unknown'),
-                'avatar': data.get('avatar', ''),
-                'total_seconds': total_seconds,
-                'in_vc': data['current_session_start'] is not None
-            })
+    """API endpoint for leaderboard"""
+    users = get_all_users()
+    current_time = datetime.utcnow().timestamp()
     
-    leaderboard_data.sort(key=lambda x: x['total_seconds'], reverse=True)
+    leaderboard = []
+    for user in users:
+        total_seconds = user['total_seconds']
+        
+        # Add current session time if in VC
+        if user['current_session_start']:
+            session_time = int(current_time - user['current_session_start'])
+            total_seconds += session_time
+        
+        leaderboard.append({
+            'user_id': str(user['user_id']),
+            'username': user['username'],
+            'avatar': user['avatar'],
+            'total_seconds': total_seconds,
+            'in_vc': user['current_session_start'] is not None
+        })
+    
+    leaderboard.sort(key=lambda x: x['total_seconds'], reverse=True)
     
     return web.json_response({
         'success': True,
-        'leaderboard': leaderboard_data[:50],
-        'total_users': len(leaderboard_data)
+        'leaderboard': leaderboard[:50],
+        'total_users': len(leaderboard)
     })
 
 
 async def handle_vc_current(request):
     """API endpoint for current VC users"""
+    users = get_all_users()
+    current_time = datetime.utcnow().timestamp()
+    
     current_users = []
-    for user_id, data in vc_tracking.items():
-        if data['current_session_start']:
-            start_time = datetime.fromisoformat(data['current_session_start'])
-            session_duration = (datetime.utcnow() - start_time).total_seconds()
+    for user in users:
+        if user['current_session_start']:
+            session_duration = int(current_time - user['current_session_start'])
             
             current_users.append({
-                'user_id': str(user_id),
-                'username': data.get('username', 'Unknown'),
-                'avatar': data.get('avatar', ''),
+                'user_id': str(user['user_id']),
+                'username': user['username'],
+                'avatar': user['avatar'],
                 'session_duration': session_duration
             })
     
@@ -578,140 +656,6 @@ async def handle_vc_current(request):
         'count': len(current_users)
     })
 
-
-async def handle_health(request):
-    """Health check endpoint"""
-    return web.Response(text='Bot is running!', status=200)
-
-
-async def handle_callback(request):
-    """OAuth callback handler"""
-    code = request.query.get('code')
-    
-    if not code:
-        return web.Response(text='Error: No authorization code provided.', content_type='text/html')
-    
-    try:
-        data = {
-            'client_id': CLIENT_ID,
-            'client_secret': CLIENT_SECRET,
-            'grant_type': 'authorization_code',
-            'code': code,
-            'redirect_uri': REDIRECT_URI
-        }
-        
-        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.post('https://discord.com/api/oauth2/token', data=data, headers=headers) as resp:
-                token_data = await resp.json()
-            
-            if 'access_token' not in token_data:
-                return web.Response(text='Error: Failed to get access token.', content_type='text/html')
-            
-            access_token = token_data['access_token']
-            
-            headers = {'Authorization': f'Bearer {access_token}'}
-            async with session.get('https://discord.com/api/users/@me', headers=headers) as resp:
-                user_data = await resp.json()
-        
-        user_id = int(user_data['id'])
-        email = user_data.get('email', 'No email provided')
-        username = user_data.get('username', 'Unknown')
-        
-        if user_id not in pending_verifications:
-            return web.Response(
-                text='Verification session expired. Please click the verify button again.',
-                content_type='text/html'
-            )
-        
-        guild_id = pending_verifications[user_id]['guild_id']
-        guild = bot.get_guild(guild_id)
-        
-        if not guild:
-            return web.Response(text='Error: Server not found.', content_type='text/html')
-        
-        member = guild.get_member(user_id)
-        if not member:
-            return web.Response(text='Error: Member not found in server.', content_type='text/html')
-        
-        verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
-        
-        if not verified_role:
-            verified_role = await guild.create_role(
-                name=VERIFIED_ROLE_NAME,
-                color=discord.Color.green(),
-                reason='Verification role'
-            )
-        
-        if verified_role in member.roles:
-            return web.Response(
-                text=f'''
-                <html>
-                    <body style="font-family: Arial; text-align: center; padding: 50px; background: #2f3136; color: white;">
-                        <h1>Already Verified</h1>
-                        <p>You already have the verified role, <strong>{username}</strong>.</p>
-                        <p>You can close this window and return to Discord.</p>
-                    </body>
-                </html>
-                ''',
-                content_type='text/html'
-            )
-        
-        await member.add_roles(verified_role)
-        
-        if WEBHOOK_URL and WEBHOOK_URL != 'YOUR_WEBHOOK_URL_HERE':
-            try:
-                webhook_embed = {
-                    "embeds": [{
-                        "title": "New Verification",
-                        "color": 0x57F287,
-                        "fields": [
-                            {"name": "User", "value": f"{username} (<@{user_id}>)", "inline": True},
-                            {"name": "User ID", "value": str(user_id), "inline": True},
-                            {"name": "Email", "value": email, "inline": False},
-                            {"name": "Server", "value": guild.name, "inline": True}
-                        ],
-                        "timestamp": discord.utils.utcnow().isoformat()
-                    }]
-                }
-                
-                async with aiohttp.ClientSession() as webhook_session:
-                    await webhook_session.post(WEBHOOK_URL, json=webhook_embed)
-            except Exception as e:
-                print(f'Error sending webhook: {e}')
-        
-        try:
-            embed = discord.Embed(color=discord.Color.green())
-            embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
-            
-            view = discord.ui.View()
-            view.add_item(discord.ui.Button(label='Verify', style=discord.ButtonStyle.success, disabled=True))
-            
-            await member.send(embed=embed, view=view)
-        except:
-            pass
-        
-        del pending_verifications[user_id]
-        print(f'✅ Verified: {username} ({user_id}) - Email: {email}')
-        
-        return web.Response(
-            text=f'''
-            <html>
-                <body style="font-family: Arial; text-align: center; padding: 50px; background: #2f3136; color: white;">
-                    <h1>Verification Successful</h1>
-                    <p>Welcome, <strong>{username}</strong>.</p>
-                    <p>Your email <strong>{email}</strong> has been verified.</p>
-                    <p>You can now close this window and return to Discord.</p>
-                </body>
-            </html>
-            ''',
-            content_type='text/html'
-        )
-        
-    except Exception as e:
-        print(f'Error in callback: {e}')
-        return web.Response(text=f'Error: {str(e)}', content_type='text/html')
 
 # ===== WEB SERVER =====
 async def start_web_server():
@@ -760,24 +704,15 @@ async def start_web_server():
 @bot.event
 async def on_ready():
     print(f'🤖 Bot logged in as {bot.user}')
-    print(f'📝 Bot ID: {bot.user.id}')
-    print(f'🏠 Connected to {len(bot.guilds)} guild(s)')
     
-    # Register persistent view
+    # Initialize database
+    init_db()
+    
+    # Your other on_ready code here...
+    
     bot.add_view(VerifyButton())
-    print('✅ Registered verification button')
-    
-    # Load VC data
-    load_vc_data()
-    
-    # Start auto-save task
-    asyncio.create_task(auto_save_vc_data())
-    print('💾 Started VC auto-save task')
-    
-    # Start web server
     asyncio.create_task(start_web_server())
     
-    # Sync commands
     try:
         synced = await bot.tree.sync()
         print(f'✅ Synced {len(synced)} slash command(s)')
