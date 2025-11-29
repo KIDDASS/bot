@@ -134,26 +134,6 @@ class VerifyButton(discord.ui.View):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         
-        # Ask for email permission
-        embed = discord.Embed(
-            title="Email Verification",
-            description="This bot needs to verify your email address to complete verification.\n\n**The bot will be able to see your email address.**\n\nDo you want to continue?",
-            color=discord.Color.blue()
-        )
-        embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
-        
-        view = EmailConsentView(interaction.user.id, interaction.guild.id)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-
-class EmailConsentView(discord.ui.View):
-    def __init__(self, user_id, guild_id):
-        super().__init__(timeout=180)
-        self.user_id = user_id
-        self.guild_id = guild_id
-    
-    @discord.ui.button(label='Yes, Continue', style=discord.ButtonStyle.success)
-    async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Generate OAuth2 URL with email access - using prompt=none for faster flow
         oauth_url = (
             f"https://discord.com/oauth2/authorize?"
@@ -165,8 +145,8 @@ class EmailConsentView(discord.ui.View):
         )
         
         # Store user info for callback
-        pending_verifications[self.user_id] = {
-            'guild_id': self.guild_id,
+        pending_verifications[interaction.user.id] = {
+            'guild_id': interaction.guild.id,
             'user': interaction.user
         }
         
@@ -183,18 +163,7 @@ class EmailConsentView(discord.ui.View):
         embed = discord.Embed(color=discord.Color.blue())
         embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
         
-        await interaction.response.edit_message(embed=embed, view=view)
-    
-    @discord.ui.button(label='No, Cancel', style=discord.ButtonStyle.danger)
-    async def decline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = discord.Embed(
-            title="Verification Cancelled",
-            description="You cannot be verified without email verification.",
-            color=discord.Color.red()
-        )
-        embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
-        
-        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 @bot.event
