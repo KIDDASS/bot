@@ -7,6 +7,8 @@ import asyncio
 import os
 from datetime import datetime, timedelta
 from collections import defaultdict
+import json
+from pathlib import Path
 
 # ===== CONFIGURATION =====
 # Using environment variables for Render deployment
@@ -55,7 +57,301 @@ automod_settings = defaultdict(lambda: {
     'anti_invite': True,
     'log_channel': None
 })
+vc_data_file = Path('vc_data.json')
+vc_tracking = defaultdict(lambda: {
+    'total_time': 0,  # in seconds
+    'current_session_start': None,
+    'username': None,
+    'avatar': None
+})
 
+# Load existing VC data
+def load_vc_data():
+    global vc_tracking
+    if vc_data_file.exists():
+        try:
+            with open(vc_data_file, 'r') as f:
+                data = json.load(f)
+                for user_id, user_data in data.items():
+                    vc_tracking[int(user_id)] = user_data
+            print(f"Loaded VC data for {len(vc_tracking)} users")
+        except Exception as e:
+            print(f"Error loading VC data: {e}")
+
+def save_vc_data():
+    try:
+        with open(vc_data_file, 'w') as f:
+            json.dump(dict(vc_tracking), f, indent=2)
+    except Exception as e:
+        print(f"Error saving VC data: {e}")
+
+# Auto-save every 5 minutes
+async def auto_save_vc_data():
+    while True:
+        await asyncio.sleep(300)  # 5 minutes
+        save_vc_data()
+        print("VC data auto-saved")
+
+
+# ===== VC EVENT HANDLERS =====
+@bot.event
+async def on_voice_state_update(member, before, after):
+    """Track voice channel join/leave times"""
+    if member.bot:
+        return
+    
+    user_id = member.id
+    current_time = datetime.utcnow()
+    
+    # User joined a VC
+    if before.channel is None and after.channel is not None:
+        vc_tracking[user_id]['current_session_start'] = current_time.isoformat()
+        vc_tracking[user_id]['username'] = str(member)
+        vc_tracking[user_id]['avatar'] = str(member.display_avatar.url)
+        print(f"{member} joined VC")
+    
+    # User left a VC
+    elif before.channel is not None and after.channel is None:
+        if vc_tracking[user_id]['current_session_start']:
+            start_time = datetime.fromisoformat(vc_tracking[user_id]['current_session_start'])
+            session_duration = (current_time - start_time).total_seconds()
+            vc_tracking[user_id]['total_time'] += session_duration
+            vc_tracking[user_id]['current_session_start'] = None
+            save_vc_data()
+            print(f"{member} left VC after {session_duration/60:.1f} minutes")
+    
+    # User switched channels (end old session, start new)
+    elif before.channel != after.channel and before.channel is not None and after.channel is not None:
+        if vc_tracking[user_id]['current_session_start']:
+            start_time = datetime.fromisoformat(vc_tracking[user_id]['current_session_start'])
+            session_duration = (current_time - start_time).total_seconds()
+            vc_tracking[user_id]['total_time'] += session_duration
+        
+        vc_tracking[user_id]['current_session_start'] = current_time.isoformat()
+        vc_tracking[user_id]['username'] = str(member)
+        vc_tracking[user_id]['avatar'] = str(member.display_avatar.url)
+        save_vc_data()
+
+
+# ===== VC COMMANDS =====
+@bot.tree.command(name='vcstats', description='View your voice channel statistics')
+async def vcstats(interaction: discord.Interaction, user: discord.User = None):
+    """Show VC stats for a user"""
+    target_user = user or interaction.user
+    user_id = target_user.id
+    
+    if user_id not in vc_tracking or vc_tracking[user_id]['total_time'] == 0:
+        await interaction.response.send_message(
+            f"{target_user.mention} has no voice channel time recorded yet.",
+            ephemeral=True
+        )
+        return
+    
+    total_seconds = vc_tracking[user_id]['total_time']
+    
+    # Add current session time if in VC
+    if vc_tracking[user_id]['current_session_start']:
+        start_time = datetime.fromisoformat(vc_tracking[user_id]['current_session_start'])
+        current_session = (datetime.utcnow() - start_time).total_seconds()
+        total_seconds += current_session
+    
+    hours = int(total_seconds // 3600)
+    minutes = int((total_seconds % 3600) // 60)
+    
+    embed = discord.Embed(
+        title=f"🎙️ Voice Channel Statistics",
+        description=f"Stats for {target_user.mention}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Total Time", value=f"{hours}h {minutes}m", inline=False)
+    
+    if vc_tracking[user_id]['current_session_start']:
+        embed.add_field(name="Status", value="🟢 Currently in VC", inline=False)
+    else:
+        embed.add_field(name="Status", value="⚫ Not in VC", inline=False)
+    
+    embed.set_thumbnail(url=target_user.display_avatar.url)
+    
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name='vcleaderboard', description='View top 10 voice channel users')
+async def vcleaderboard(interaction: discord.Interaction):
+    """Show VC leaderboard"""
+    if not vc_tracking:
+        await interaction.response.send_message("No voice channel data recorded yet.", ephemeral=True)
+        return
+    
+    # Calculate total time including current sessions
+    leaderboard_data = []
+    for user_id, data in vc_tracking.items():
+        total_seconds = data['total_time']
+        
+        if data['current_session_start']:
+            start_time = datetime.fromisoformat(data['current_session_start'])
+            current_session = (datetime.utcnow() - start_time).total_seconds()
+            total_seconds += current_session
+        
+        if total_seconds > 0:
+            leaderboard_data.append({
+                'user_id': user_id,
+                'username': data.get('username', 'Unknown'),
+                'total_seconds': total_seconds,
+                'in_vc': data['current_session_start'] is not None
+            })
+    
+    # Sort by total time
+    leaderboard_data.sort(key=lambda x: x['total_seconds'], reverse=True)
+    
+    embed = discord.Embed(
+        title="🏆 Voice Channel Leaderboard",
+        description="Top voice channel users",
+        color=discord.Color.gold()
+    )
+    
+    medals = ["🥇", "🥈", "🥉"]
+    for i, entry in enumerate(leaderboard_data[:10]):
+        hours = int(entry['total_seconds'] // 3600)
+        minutes = int((entry['total_seconds'] % 3600) // 60)
+        
+        medal = medals[i] if i < 3 else f"{i+1}."
+        status = "🟢" if entry['in_vc'] else "⚫"
+        
+        embed.add_field(
+            name=f"{medal} {entry['username']} {status}",
+            value=f"{hours}h {minutes}m",
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name='resetvcstats', description='Reset all VC statistics (Admin only)')
+@app_commands.default_permissions(administrator=True)
+async def resetvcstats(interaction: discord.Interaction):
+    """Reset all VC stats"""
+    global vc_tracking
+    vc_tracking.clear()
+    save_vc_data()
+    await interaction.response.send_message("All VC statistics have been reset.", ephemeral=True)
+
+
+# ===== WEB API ENDPOINTS FOR LEADERBOARD =====
+async def handle_vc_leaderboard(request):
+    """API endpoint for leaderboard data"""
+    # Calculate total time including current sessions
+    leaderboard_data = []
+    for user_id, data in vc_tracking.items():
+        total_seconds = data['total_time']
+        
+        if data['current_session_start']:
+            start_time = datetime.fromisoformat(data['current_session_start'])
+            current_session = (datetime.utcnow() - start_time).total_seconds()
+            total_seconds += current_session
+        
+        if total_seconds > 0:
+            leaderboard_data.append({
+                'user_id': str(user_id),
+                'username': data.get('username', 'Unknown'),
+                'avatar': data.get('avatar', ''),
+                'total_seconds': total_seconds,
+                'in_vc': data['current_session_start'] is not None
+            })
+    
+    # Sort by total time
+    leaderboard_data.sort(key=lambda x: x['total_seconds'], reverse=True)
+    
+    return web.json_response({
+        'success': True,
+        'leaderboard': leaderboard_data[:50],  # Top 50
+        'total_users': len(leaderboard_data)
+    })
+
+
+async def handle_vc_current(request):
+    """API endpoint for current VC users"""
+    current_users = []
+    for user_id, data in vc_tracking.items():
+        if data['current_session_start']:
+            start_time = datetime.fromisoformat(data['current_session_start'])
+            session_duration = (datetime.utcnow() - start_time).total_seconds()
+            
+            current_users.append({
+                'user_id': str(user_id),
+                'username': data.get('username', 'Unknown'),
+                'avatar': data.get('avatar', ''),
+                'session_duration': session_duration
+            })
+    
+    # Sort by session duration
+    current_users.sort(key=lambda x: x['session_duration'], reverse=True)
+    
+    return web.json_response({
+        'success': True,
+        'current_users': current_users,
+        'count': len(current_users)
+    })
+
+
+# MODIFY the start_web_server function to add new routes:
+async def start_web_server():
+    """Start the web server for OAuth callbacks and API"""
+    app = web.Application()
+    app.router.add_get('/callback', handle_callback)
+    app.router.add_get('/', handle_health)
+    app.router.add_get('/health', handle_health)
+    
+    # Add VC tracking API endpoints
+    app.router.add_get('/api/leaderboard', handle_vc_leaderboard)
+    app.router.add_get('/api/current', handle_vc_current)
+    
+    # Enable CORS for web access
+    @web.middleware
+    async def cors_middleware(request, handler):
+        if request.method == "OPTIONS":
+            response = web.Response()
+        else:
+            response = await handler(request)
+        
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return response
+    
+    app.middlewares.append(cors_middleware)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.getenv('PORT', 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f'Web server started on port {port}')
+
+
+# MODIFY the on_ready event to load VC data and start auto-save:
+# Add these lines after bot.add_view(VerifyButton()) in on_ready:
+@bot.event
+async def on_ready():
+    print(f'Bot logged in as {bot.user}')
+    
+    # Register the persistent view
+    bot.add_view(VerifyButton())
+    
+    # Load VC tracking data
+    load_vc_data()
+    
+    # Start auto-save task
+    asyncio.create_task(auto_save_vc_data())
+    
+    # Start web server for OAuth callback and API
+    asyncio.create_task(start_web_server())
+    
+    try:
+        synced = await bot.tree.sync()
+        print(f'Synced {len(synced)} command(s)')
+    except Exception as e:
+        print(f'Error syncing commands: {e}')
 
 # ===== SECURITY FUNCTIONS =====
 async def log_action(guild, action_type, user, moderator, reason, color=discord.Color.orange()):
