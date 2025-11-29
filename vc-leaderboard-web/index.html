@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Channel Leaderboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        header {
+            text-align: center;
+            color: white;
+            margin-bottom: 40px;
+        }
+
+        h1 {
+            font-size: 3rem;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .subtitle {
+            font-size: 1.2rem;
+            opacity: 0.9;
+        }
+
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            justify-content: center;
+        }
+
+        .tab-btn {
+            background: rgba(255,255,255,0.2);
+            border: 2px solid rgba(255,255,255,0.3);
+            color: white;
+            padding: 12px 30px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 1.1rem;
+            transition: all 0.3s;
+            backdrop-filter: blur(10px);
+        }
+
+        .tab-btn:hover {
+            background: rgba(255,255,255,0.3);
+            transform: translateY(-2px);
+        }
+
+        .tab-btn.active {
+            background: white;
+            color: #667eea;
+            border-color: white;
+        }
+
+        .content-section {
+            display: none;
+        }
+
+        .content-section.active {
+            display: block;
+        }
+
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 20px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            font-size: 0.9rem;
+            opacity: 0.9;
+        }
+
+        .leaderboard-item {
+            display: flex;
+            align-items: center;
+            padding: 15px;
+            margin-bottom: 10px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            transition: all 0.3s;
+        }
+
+        .leaderboard-item:hover {
+            transform: translateX(5px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+
+        .rank {
+            font-size: 1.5rem;
+            font-weight: bold;
+            width: 50px;
+            text-align: center;
+        }
+
+        .rank-1 { color: #FFD700; }
+        .rank-2 { color: #C0C0C0; }
+        .rank-3 { color: #CD7F32; }
+
+        .avatar {
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            margin: 0 15px;
+            border: 3px solid #667eea;
+        }
+
+        .user-info {
+            flex: 1;
+        }
+
+        .username {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .time {
+            font-size: 1.2rem;
+            font-weight: bold;
+            color: #667eea;
+            margin-right: 10px;
+        }
+
+        .status {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-left: 10px;
+        }
+
+        .status.online {
+            background: #43b581;
+            box-shadow: 0 0 10px #43b581;
+        }
+
+        .status.offline {
+            background: #747f8d;
+        }
+
+        .current-user-card {
+            background: linear-gradient(135deg, #43b581 0%, #3aa76d 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #667eea;
+            font-size: 1.2rem;
+        }
+
+        .error {
+            background: #f8d7da;
+            color: #721c24;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+
+        .refresh-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1rem;
+            float: right;
+            transition: all 0.3s;
+        }
+
+        .refresh-btn:hover {
+            background: #5568d3;
+            transform: scale(1.05);
+        }
+
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 2rem;
+            }
+
+            .leaderboard-item {
+                flex-wrap: wrap;
+            }
+
+            .stats-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎙️ Voice Channel Leaderboard</h1>
+            <p class="subtitle">Track your voice activity and compete with others</p>
+        </header>
+
+        <div class="tabs">
+            <button class="tab-btn active" onclick="switchTab('leaderboard')">🏆 Leaderboard</button>
+            <button class="tab-btn" onclick="switchTab('current')">🟢 Currently in VC</button>
+        </div>
+
+        <!-- Leaderboard Section -->
+        <div id="leaderboard" class="content-section active">
+            <div class="card">
+                <button class="refresh-btn" onclick="loadLeaderboard()">🔄 Refresh</button>
+                <h2 style="margin-bottom: 20px;">Top Voice Channel Users</h2>
+                
+                <div class="stats-grid" id="stats">
+                    <div class="stat-card">
+                        <div class="stat-value" id="totalUsers">-</div>
+                        <div class="stat-label">Total Users</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="totalTime">-</div>
+                        <div class="stat-label">Total Hours</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="activeUsers">-</div>
+                        <div class="stat-label">Active Now</div>
+                    </div>
+                </div>
+
+                <div id="leaderboardContent">
+                    <div class="loading">Loading leaderboard...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Current VC Section -->
+        <div id="current" class="content-section">
+            <div class="card">
+                <button class="refresh-btn" onclick="loadCurrentUsers()">🔄 Refresh</button>
+                <h2 style="margin-bottom: 20px;">Currently in Voice Channels</h2>
+                
+                <div id="currentContent">
+                    <div class="loading">Loading current users...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // CHANGE THIS TO YOUR RENDER BOT URL
+        const API_URL = 'https://bot-9q8b.onrender.com/';
+        
+        let currentTab = 'leaderboard';
+        let autoRefreshInterval;
+
+        function switchTab(tab) {
+            currentTab = tab;
+            
+            // Update tab buttons
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            event.target.classList.add('active');
+            
+            // Update content sections
+            document.querySelectorAll('.content-section').forEach(section => {
+                section.classList.remove('active');
+            });
+            document.getElementById(tab).classList.add('active');
+            
+            // Load appropriate data
+            if (tab === 'leaderboard') {
+                loadLeaderboard();
+            } else {
+                loadCurrentUsers();
+            }
+            
+            // Reset auto-refresh
+            setupAutoRefresh();
+        }
+
+        function formatTime(seconds) {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            return `${hours}h ${minutes}m`;
+        }
+
+        function formatSessionTime(seconds) {
+            const hours = Math.floor(seconds / 3600);
+            const minutes = Math.floor((seconds % 3600) / 60);
+            const secs = Math.floor(seconds % 60);
+            
+            if (hours > 0) {
+                return `${hours}h ${minutes}m`;
+            } else if (minutes > 0) {
+                return `${minutes}m ${secs}s`;
+            } else {
+                return `${secs}s`;
+            }
+        }
+
+        function getRankMedal(rank) {
+            if (rank === 1) return '🥇';
+            if (rank === 2) return '🥈';
+            if (rank === 3) return '🥉';
+            return `${rank}.`;
+        }
+
+        async function loadLeaderboard() {
+            const content = document.getElementById('leaderboardContent');
+            content.innerHTML = '<div class="loading">Loading leaderboard...</div>';
+            
+            try {
+                const response = await fetch(`${API_URL}/api/leaderboard`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    // Update stats
+                    document.getElementById('totalUsers').textContent = data.total_users;
+                    
+                    const totalHours = data.leaderboard.reduce((sum, user) => sum + user.total_seconds, 0) / 3600;
+                    document.getElementById('totalTime').textContent = Math.floor(totalHours) + 'h';
+                    
+                    const activeCount = data.leaderboard.filter(user => user.in_vc).length;
+                    document.getElementById('activeUsers').textContent = activeCount;
+                    
+                    // Render leaderboard
+                    if (data.leaderboard.length === 0) {
+                        content.innerHTML = '<p style="text-align: center; color: #999;">No data yet. Start using voice channels!</p>';
+                        return;
+                    }
+                    
+                    let html = '';
+                    data.leaderboard.forEach((user, index) => {
+                        const rankClass = index < 3 ? `rank-${index + 1}` : '';
+                        const statusClass = user.in_vc ? 'online' : 'offline';
+                        const avatarUrl = user.avatar || 'https://cdn.discordapp.com/embed/avatars/0.png';
+                        
+                        html += `
+                            <div class="leaderboard-item">
+                                <div class="rank ${rankClass}">${getRankMedal(index + 1)}</div>
+                                <img class="avatar" src="${avatarUrl}" alt="${user.username}">
+                                <div class="user-info">
+                                    <div class="username">
+                                        ${user.username}
+                                        <span class="status ${statusClass}"></span>
+                                    </div>
+                                </div>
+                                <div class="time">${formatTime(user.total_seconds)}</div>
+                            </div>
+                        `;
+                    });
+                    
+                    content.innerHTML = html;
+                } else {
+                    content.innerHTML = '<div class="error">Failed to load leaderboard data</div>';
+                }
+            } catch (error) {
+                console.error('Error loading leaderboard:', error);
+                content.innerHTML = '<div class="error">Error connecting to server. Make sure the bot is running!</div>';
+            }
+        }
+
+        async function loadCurrentUsers() {
+            const content = document.getElementById('currentContent');
+            content.innerHTML = '<div class="loading">Loading current users...</div>';
+            
+            try {
+                const response = await fetch(`${API_URL}/api/current`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    if (data.current_users.length === 0) {
+                        content.innerHTML = '<p style="text-align: center; color: #999;">No one is currently in voice channels</p>';
+                        return;
+                    }
+                    
+                    let html = '';
+                    data.current_users.forEach(user => {
+                        const avatarUrl = user.avatar || 'https://cdn.discordapp.com/embed/avatars/0.png';
+                        
+                        html += `
+                            <div class="current-user-card">
+                                <img class="avatar" src="${avatarUrl}" alt="${user.username}" style="border-color: white;">
+                                <div class="user-info">
+                                    <div class="username" style="color: white; font-size: 1.2rem;">
+                                        ${user.username}
+                                    </div>
+                                    <div style="opacity: 0.9;">Session: ${formatSessionTime(user.session_duration)}</div>
+                                </div>
+                                <div style="font-size: 2rem;">🎙️</div>
+                            </div>
+                        `;
+                    });
+                    
+                    content.innerHTML = html;
+                } else {
+                    content.innerHTML = '<div class="error">Failed to load current users</div>';
+                }
+            } catch (error) {
+                console.error('Error loading current users:', error);
+                content.innerHTML = '<div class="error">Error connecting to server. Make sure the bot is running!</div>';
+            }
+        }
+
+        function setupAutoRefresh() {
+            // Clear existing interval
+            if (autoRefreshInterval) {
+                clearInterval(autoRefreshInterval);
+            }
+            
+            // Auto-refresh every 30 seconds
+            autoRefreshInterval = setInterval(() => {
+                if (currentTab === 'leaderboard') {
+                    loadLeaderboard();
+                } else {
+                    loadCurrentUsers();
+                }
+            }, 30000);
+        }
+
+        // Initial load
+        window.addEventListener('load', () => {
+            loadLeaderboard();
+            setupAutoRefresh();
+        });
+    </script>
+</body>
+</html>
