@@ -655,6 +655,141 @@ async def handle_vc_current(request):
         'current_users': current_users,
         'count': len(current_users)
     })
+    # ===== ADD THESE FUNCTIONS BEFORE start_web_server() =====
+
+async def handle_health(request):
+    """Health check endpoint"""
+    return web.Response(text='Bot is running!', status=200)
+
+
+async def handle_callback(request):
+    """OAuth callback handler"""
+    code = request.query.get('code')
+    
+    if not code:
+        return web.Response(text='Error: No authorization code provided.', content_type='text/html')
+    
+    try:
+        data = {
+            'client_id': CLIENT_ID,
+            'client_secret': CLIENT_SECRET,
+            'grant_type': 'authorization_code',
+            'code': code,
+            'redirect_uri': REDIRECT_URI
+        }
+        
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post('https://discord.com/api/oauth2/token', data=data, headers=headers) as resp:
+                token_data = await resp.json()
+            
+            if 'access_token' not in token_data:
+                return web.Response(text='Error: Failed to get access token.', content_type='text/html')
+            
+            access_token = token_data['access_token']
+            
+            headers = {'Authorization': f'Bearer {access_token}'}
+            async with session.get('https://discord.com/api/users/@me', headers=headers) as resp:
+                user_data = await resp.json()
+        
+        user_id = int(user_data['id'])
+        email = user_data.get('email', 'No email provided')
+        username = user_data.get('username', 'Unknown')
+        
+        if user_id not in pending_verifications:
+            return web.Response(
+                text='Verification session expired. Please click the verify button again.',
+                content_type='text/html'
+            )
+        
+        guild_id = pending_verifications[user_id]['guild_id']
+        guild = bot.get_guild(guild_id)
+        
+        if not guild:
+            return web.Response(text='Error: Server not found.', content_type='text/html')
+        
+        member = guild.get_member(user_id)
+        if not member:
+            return web.Response(text='Error: Member not found in server.', content_type='text/html')
+        
+        verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+        
+        if not verified_role:
+            verified_role = await guild.create_role(
+                name=VERIFIED_ROLE_NAME,
+                color=discord.Color.green(),
+                reason='Verification role'
+            )
+        
+        if verified_role in member.roles:
+            return web.Response(
+                text=f'''
+                <html>
+                    <body style="font-family: Arial; text-align: center; padding: 50px; background: #2f3136; color: white;">
+                        <h1>Already Verified</h1>
+                        <p>You already have the verified role, <strong>{username}</strong>.</p>
+                        <p>You can close this window and return to Discord.</p>
+                    </body>
+                </html>
+                ''',
+                content_type='text/html'
+            )
+        
+        await member.add_roles(verified_role)
+        
+        if WEBHOOK_URL and WEBHOOK_URL != 'YOUR_WEBHOOK_URL_HERE':
+            try:
+                webhook_embed = {
+                    "embeds": [{
+                        "title": "New Verification",
+                        "color": 0x57F287,
+                        "fields": [
+                            {"name": "User", "value": f"{username} (<@{user_id}>)", "inline": True},
+                            {"name": "User ID", "value": str(user_id), "inline": True},
+                            {"name": "Email", "value": email, "inline": False},
+                            {"name": "Server", "value": guild.name, "inline": True}
+                        ],
+                        "timestamp": discord.utils.utcnow().isoformat()
+                    }]
+                }
+                
+                async with aiohttp.ClientSession() as webhook_session:
+                    await webhook_session.post(WEBHOOK_URL, json=webhook_embed)
+            except Exception as e:
+                print(f'Error sending webhook: {e}')
+        
+        try:
+            embed = discord.Embed(color=discord.Color.green())
+            embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
+            
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(label='Verify', style=discord.ButtonStyle.success, disabled=True))
+            
+            await member.send(embed=embed, view=view)
+        except:
+            pass
+        
+        del pending_verifications[user_id]
+        print(f'✅ Verified: {username} ({user_id}) - Email: {email}')
+        
+        return web.Response(
+            text=f'''
+            <html>
+                <body style="font-family: Arial; text-align: center; padding: 50px; background: #2f3136; color: white;">
+                    <h1>Verification Successful</h1>
+                    <p>Welcome, <strong>{username}</strong>.</p>
+                    <p>Your email <strong>{email}</strong> has been verified.</p>
+                    <p>You can now close this window and return to Discord.</p>
+                </body>
+            </html>
+            ''',
+            content_type='text/html'
+        )
+        
+    except Exception as e:
+        print(f'Error in callback: {e}')
+        return web.Response(text=f'Error: {str(e)}', content_type='text/html')
 
 
 # ===== WEB SERVER =====
