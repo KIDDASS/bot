@@ -10,7 +10,29 @@ from collections import defaultdict
 import json
 from pathlib import Path
 import sqlite3
-from pathlib import Path
+import logging
+from functools import wraps
+import time
+
+# ===== LOGGING SETUP =====
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('discord_bot')
+
+# ===== ENVIRONMENT VALIDATION =====
+REQUIRED_ENV_VARS = ['BOT_TOKEN', 'CLIENT_ID', 'CLIENT_SECRET', 'REDIRECT_URI']
+missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
+
+if missing_vars:
+    logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
+    logger.error("Bot cannot start without these variables.")
+    exit(1)
 
 # ===== CONFIGURATION =====
 BOT_TOKEN = os.getenv('BOT_TOKEN')
@@ -19,6 +41,7 @@ CLIENT_SECRET = os.getenv('CLIENT_SECRET')
 REDIRECT_URI = os.getenv('REDIRECT_URI')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 VERIFIED_ROLE_NAME = os.getenv('VERIFIED_ROLE_NAME', 'Verified')
+ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*').split(',')
 
 SPAM_THRESHOLD = 5
 SPAM_TIMEFRAME = 5
@@ -45,88 +68,122 @@ automod_settings = defaultdict(lambda: {
     'log_channel': None
 })
 
-vc_data_file = Path('vc_data.json')
-vc_tracking = defaultdict(lambda: {
-    'total_time': 0,
-    'current_session_start': None,
-    'username': None,
-    'avatar': None
-})
+# Database path - environment aware
+DB_FILE = os.getenv('DB_PATH', './data/vc_data.db')
+os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
 
-# ===== VC DATA FUNCTIONS =====
-DB_FILE = '/opt/render/project/src/vc_data.db'  # Render's persistent path
-
+# ===== DATABASE FUNCTIONS =====
 def init_db():
     """Initialize SQLite database"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS vc_users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            avatar TEXT,
-            total_seconds INTEGER DEFAULT 0,
-            current_session_start REAL,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-    print("✅ Database initialized")
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS vc_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                avatar TEXT,
+                total_seconds INTEGER DEFAULT 0,
+                current_session_start REAL,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+        logger.info("✅ Database initialized")
+    except Exception as e:
+        logger.error(f"❌ Database initialization failed: {e}")
+        raise
 
 def get_user_data(user_id):
     """Get user VC data"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    c.execute('SELECT * FROM vc_users WHERE user_id = ?', (user_id,))
-    result = c.fetchone()
-    
-    conn.close()
-    
-    if result:
-        return {
-            'user_id': result[0],
-            'username': result[1],
-            'avatar': result[2],
-            'total_seconds': result[3],
-            'current_session_start': result[4]
-        }
-    return None
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        c.execute('SELECT * FROM vc_users WHERE user_id = ?', (user_id,))
+        result = c.fetchone()
+        
+        conn.close()
+        
+        if result:
+            return {
+                'user_id': result[0],
+                'username': result[1],
+                'avatar': result[2],
+                'total_seconds': result[3],
+                'current_session_start': result[4]
+            }
+        return None
+    except Exception as e:
+        logger.error(f"Error getting user data for {user_id}: {e}")
+        return None
 
 def save_user_data(user_id, username, avatar, total_seconds, session_start):
     """Save/update user VC data"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    c.execute('''
-        INSERT OR REPLACE INTO vc_users 
-        (user_id, username, avatar, total_seconds, current_session_start, last_updated)
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ''', (user_id, username, avatar, total_seconds, session_start))
-    
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        c.execute('''
+            INSERT OR REPLACE INTO vc_users 
+            (user_id, username, avatar, total_seconds, current_session_start, last_updated)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (user_id, username, avatar, total_seconds, session_start))
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Error saving user data for {user_id}: {e}")
+        return False
 
 def get_all_users():
     """Get all users with VC data"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    
-    c.execute('SELECT * FROM vc_users ORDER BY total_seconds DESC')
-    results = c.fetchall()
-    
-    conn.close()
-    
-    return [{
-        'user_id': row[0],
-        'username': row[1],
-        'avatar': row[2],
-        'total_seconds': row[3],
-        'current_session_start': row[4]
-    } for row in results]
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        
+        c.execute('SELECT * FROM vc_users ORDER BY total_seconds DESC')
+        results = c.fetchall()
+        
+        conn.close()
+        
+        return [{
+            'user_id': row[0],
+            'username': row[1],
+            'avatar': row[2],
+            'total_seconds': row[3],
+            'current_session_start': row[4]
+        } for row in results]
+    except Exception as e:
+        logger.error(f"Error getting all users: {e}")
+        return []
+
+# ===== BACKGROUND TASKS =====
+async def cleanup_pending_verifications():
+    """Remove expired verification sessions"""
+    while True:
+        try:
+            await asyncio.sleep(300)  # Run every 5 minutes
+            
+            expired = []
+            current_time = datetime.utcnow()
+            
+            for user_id, data in pending_verifications.items():
+                if 'timestamp' in data:
+                    if (current_time - data['timestamp']).total_seconds() > 600:  # 10 min timeout
+                        expired.append(user_id)
+            
+            for user_id in expired:
+                del pending_verifications[user_id]
+            
+            if expired:
+                logger.info(f"🧹 Cleaned up {len(expired)} expired verification sessions")
+        except Exception as e:
+            logger.error(f"Error in verification cleanup: {e}")
 
 # ===== VC EVENT HANDLERS =====
 @bot.event
@@ -153,7 +210,7 @@ async def on_voice_state_update(member, before, after):
             total_seconds,
             current_time
         )
-        print(f"🎤 {member} joined VC")
+        logger.info(f"🎤 {member} joined VC")
     
     # User left VC
     elif before.channel is not None and after.channel is None:
@@ -170,7 +227,7 @@ async def on_voice_state_update(member, before, after):
                 new_total,
                 None
             )
-            print(f"👋 {member} left VC. Session: {session_duration}s, Total: {new_total}s")
+            logger.info(f"👋 {member} left VC. Session: {session_duration}s, Total: {new_total}s")
     
     # User switched channels
     elif before.channel != after.channel:
@@ -187,7 +244,7 @@ async def on_voice_state_update(member, before, after):
                 new_total,
                 current_time
             )
-            print(f"🔄 {member} switched channels")
+            logger.info(f"🔄 {member} switched channels")
 
 # ===== VC COMMANDS =====
 @bot.tree.command(name='vcstats', description='View voice channel statistics')
@@ -195,18 +252,21 @@ async def vcstats(interaction: discord.Interaction, user: discord.User = None):
     target_user = user or interaction.user
     user_id = target_user.id
     
-    if user_id not in vc_tracking or vc_tracking[user_id]['total_time'] == 0:
+    # Get from database
+    user_data = get_user_data(user_id)
+    
+    if not user_data or user_data['total_seconds'] == 0:
         await interaction.response.send_message(
             f"{target_user.mention} has no voice channel time recorded yet.",
             ephemeral=True
         )
         return
     
-    total_seconds = vc_tracking[user_id]['total_time']
+    total_seconds = user_data['total_seconds']
     
-    if vc_tracking[user_id]['current_session_start']:
-        start_time = datetime.fromisoformat(vc_tracking[user_id]['current_session_start'])
-        current_session = (datetime.utcnow() - start_time).total_seconds()
+    # Calculate current session if in VC
+    if user_data['current_session_start']:
+        current_session = datetime.utcnow().timestamp() - user_data['current_session_start']
         total_seconds += current_session
     
     hours = int(total_seconds // 3600)
@@ -219,7 +279,7 @@ async def vcstats(interaction: discord.Interaction, user: discord.User = None):
     )
     embed.add_field(name="Total Time", value=f"{hours}h {minutes}m", inline=False)
     
-    if vc_tracking[user_id]['current_session_start']:
+    if user_data['current_session_start']:
         embed.add_field(name="Status", value="🟢 Currently in VC", inline=False)
     else:
         embed.add_field(name="Status", value="⚫ Not in VC", inline=False)
@@ -230,25 +290,29 @@ async def vcstats(interaction: discord.Interaction, user: discord.User = None):
 
 @bot.tree.command(name='vcleaderboard', description='View top 10 voice channel users')
 async def vcleaderboard(interaction: discord.Interaction):
-    if not vc_tracking:
+    users = get_all_users()
+    
+    if not users:
         await interaction.response.send_message("No voice channel data recorded yet.", ephemeral=True)
         return
     
+    current_time = datetime.utcnow().timestamp()
     leaderboard_data = []
-    for user_id, data in vc_tracking.items():
-        total_seconds = data['total_time']
+    
+    for user in users:
+        total_seconds = user['total_seconds']
         
-        if data['current_session_start']:
-            start_time = datetime.fromisoformat(data['current_session_start'])
-            current_session = (datetime.utcnow() - start_time).total_seconds()
+        # Add current session time
+        if user['current_session_start']:
+            current_session = current_time - user['current_session_start']
             total_seconds += current_session
         
         if total_seconds > 0:
             leaderboard_data.append({
-                'user_id': user_id,
-                'username': data.get('username', 'Unknown'),
+                'user_id': user['user_id'],
+                'username': user['username'],
                 'total_seconds': total_seconds,
-                'in_vc': data['current_session_start'] is not None
+                'in_vc': user['current_session_start'] is not None
             })
     
     leaderboard_data.sort(key=lambda x: x['total_seconds'], reverse=True)
@@ -279,10 +343,19 @@ async def vcleaderboard(interaction: discord.Interaction):
 @bot.tree.command(name='resetvcstats', description='Reset all VC statistics (Admin only)')
 @app_commands.default_permissions(administrator=True)
 async def resetvcstats(interaction: discord.Interaction):
-    global vc_tracking
-    vc_tracking.clear()
-    save_vc_data()
-    await interaction.response.send_message("All VC statistics have been reset.", ephemeral=True)
+    try:
+        # Clear database
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute('DELETE FROM vc_users')
+        conn.commit()
+        conn.close()
+        
+        await interaction.response.send_message("All VC statistics have been reset.", ephemeral=True)
+        logger.info(f"VC stats reset by {interaction.user}")
+    except Exception as e:
+        logger.error(f"Error resetting VC stats: {e}")
+        await interaction.response.send_message("Error resetting statistics.", ephemeral=True)
 
 # ===== SECURITY FUNCTIONS =====
 async def log_action(guild, action_type, user, moderator, reason, color=discord.Color.orange()):
@@ -296,7 +369,10 @@ async def log_action(guild, action_type, user, moderator, reason, color=discord.
                 color=color,
                 timestamp=datetime.utcnow()
             )
-            await channel.send(embed=embed)
+            try:
+                await channel.send(embed=embed)
+            except Exception as e:
+                logger.error(f"Error logging action: {e}")
 
 
 async def check_spam(message):
@@ -361,7 +437,8 @@ class VerifyButton(discord.ui.View):
         
         pending_verifications[interaction.user.id] = {
             'guild_id': interaction.guild.id,
-            'user': interaction.user
+            'user': interaction.user,
+            'timestamp': datetime.utcnow()  # Add timestamp for cleanup
         }
         
         verify_button = discord.ui.Button(
@@ -392,31 +469,35 @@ async def on_member_join(member):
                     color=discord.Color.green()
                 )
             
+            # Only lock text channels, not categories
+            locked = 0
             for channel in member.guild.channels:
-                try:
-                    await channel.set_permissions(
-                        member.guild.default_role,
-                        send_messages=False,
-                        reason="Raid protection activated"
-                    )
-                    await channel.set_permissions(
-                        verified_role,
-                        send_messages=True,
-                        reason="Raid protection - verified users"
-                    )
-                except:
-                    pass
+                if isinstance(channel, discord.TextChannel):
+                    try:
+                        await channel.set_permissions(
+                            member.guild.default_role,
+                            send_messages=False,
+                            reason="Raid protection activated"
+                        )
+                        await channel.set_permissions(
+                            verified_role,
+                            send_messages=True,
+                            reason="Raid protection - verified users"
+                        )
+                        locked += 1
+                    except Exception as e:
+                        logger.error(f"Error locking channel {channel.name}: {e}")
             
             await log_action(
                 member.guild,
                 "RAID DETECTED",
                 member,
                 "AutoMod",
-                f"Server locked down - {RAID_THRESHOLD} joins in {RAID_TIMEFRAME}s",
+                f"Server locked down - {RAID_THRESHOLD} joins in {RAID_TIMEFRAME}s ({locked} channels locked)",
                 discord.Color.red()
             )
         except Exception as e:
-            print(f"Error activating raid protection: {e}")
+            logger.error(f"Error activating raid protection: {e}")
     
     account_age = (datetime.utcnow() - member.created_at).days
     if account_age < 7:
@@ -458,8 +539,8 @@ async def on_message(message):
                 )
                 await asyncio.sleep(5)
                 await warning_msg.delete()
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error handling spam: {e}")
     
     if automod_settings[message.guild.id]['anti_mention_spam']:
         if len(message.mentions) >= MENTION_SPAM_LIMIT:
@@ -474,8 +555,8 @@ async def on_message(message):
                     f"Mention spam ({len(message.mentions)} mentions)",
                     discord.Color.red()
                 )
-            except:
-                pass
+            except Exception as e:
+                logger.error(f"Error handling mention spam: {e}")
     
     if automod_settings[message.guild.id]['anti_invite']:
         if 'discord.gg/' in message.content.lower() or 'discord.com/invite/' in message.content.lower():
@@ -494,15 +575,15 @@ async def on_message(message):
                         "Unauthorized invite link posted",
                         discord.Color.orange()
                     )
-                except:
-                    pass
+                except Exception as e:
+                    logger.error(f"Error blocking invite: {e}")
     
     await bot.process_commands(message)
 
 
 @bot.event
 async def on_error(event, *args, **kwargs):
-    print(f'❌ Error in {event}')
+    logger.error(f'Error in {event}')
     import traceback
     traceback.print_exc()
 
@@ -523,16 +604,18 @@ async def lockdown(interaction: discord.Interaction):
     await interaction.response.defer()
     
     locked = 0
+    # Only lock text/voice channels, not categories
     for channel in interaction.guild.channels:
-        try:
-            await channel.set_permissions(
-                interaction.guild.default_role,
-                send_messages=False,
-                reason=f"Lockdown by {interaction.user}"
-            )
-            locked += 1
-        except:
-            pass
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+            try:
+                await channel.set_permissions(
+                    interaction.guild.default_role,
+                    send_messages=False,
+                    reason=f"Lockdown by {interaction.user}"
+                )
+                locked += 1
+            except Exception as e:
+                logger.error(f"Failed to lock {channel.name}: {e}")
     
     await interaction.followup.send(f"Locked down {locked} channels!")
     await log_action(
@@ -540,7 +623,7 @@ async def lockdown(interaction: discord.Interaction):
         "LOCKDOWN",
         interaction.user,
         interaction.user.mention,
-        "Server locked down",
+        f"Server locked down ({locked} channels)",
         discord.Color.red()
     )
 
@@ -552,15 +635,16 @@ async def unlock(interaction: discord.Interaction):
     
     unlocked = 0
     for channel in interaction.guild.channels:
-        try:
-            await channel.set_permissions(
-                interaction.guild.default_role,
-                send_messages=None,
-                reason=f"Unlock by {interaction.user}"
-            )
-            unlocked += 1
-        except:
-            pass
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+            try:
+                await channel.set_permissions(
+                    interaction.guild.default_role,
+                    send_messages=None,
+                    reason=f"Unlock by {interaction.user}"
+                )
+                unlocked += 1
+            except Exception as e:
+                logger.error(f"Failed to unlock {channel.name}: {e}")
     
     await interaction.followup.send(f"Unlocked {unlocked} channels!")
     await log_action(
@@ -568,7 +652,7 @@ async def unlock(interaction: discord.Interaction):
         "UNLOCK",
         interaction.user,
         interaction.user.mention,
-        "Server unlocked",
+        f"Server unlocked ({unlocked} channels)",
         discord.Color.green()
     )
 
@@ -589,13 +673,13 @@ async def security_settings(interaction: discord.Interaction):
         title="Security Settings",
         color=discord.Color.blue()
     )
-    embed.add_field(name="Anti-Spam", value="Enabled" if settings['anti_spam'] else "Disabled")
-    embed.add_field(name="Anti-Raid", value="Enabled" if settings['anti_raid'] else "Disabled")
-    embed.add_field(name="Anti-Mention Spam", value="Enabled" if settings['anti_mention_spam'] else "Disabled")
-    embed.add_field(name="Anti-Invite", value="Enabled" if settings['anti_invite'] else "Disabled")
+    embed.add_field(name="Anti-Spam", value="✅ Enabled" if settings['anti_spam'] else "❌ Disabled")
+    embed.add_field(name="Anti-Raid", value="✅ Enabled" if settings['anti_raid'] else "❌ Disabled")
+    embed.add_field(name="Anti-Mention Spam", value="✅ Enabled" if settings['anti_mention_spam'] else "❌ Disabled")
+    embed.add_field(name="Anti-Invite", value="✅ Enabled" if settings['anti_invite'] else "❌ Disabled")
     
     log_channel = interaction.guild.get_channel(settings['log_channel']) if settings['log_channel'] else None
-    embed.add_field(name="Log Channel", value=log_channel.mention if log_channel else "Not set")
+    embed.add_field(name="Log Channel", value=log_channel.mention if log_channel else "Not set", inline=False)
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -655,7 +739,7 @@ async def handle_vc_current(request):
         'current_users': current_users,
         'count': len(current_users)
     })
-    # ===== ADD THESE FUNCTIONS BEFORE start_web_server() =====
+
 
 async def handle_health(request):
     """Health check endpoint"""
@@ -740,6 +824,9 @@ async def handle_callback(request):
         
         if WEBHOOK_URL and WEBHOOK_URL != 'YOUR_WEBHOOK_URL_HERE':
             try:
+                # Mask email for privacy
+                masked_email = email[:2] + '***@' + email.split('@')[1] if '@' in email else '***'
+                
                 webhook_embed = {
                     "embeds": [{
                         "title": "New Verification",
@@ -747,7 +834,7 @@ async def handle_callback(request):
                         "fields": [
                             {"name": "User", "value": f"{username} (<@{user_id}>)", "inline": True},
                             {"name": "User ID", "value": str(user_id), "inline": True},
-                            {"name": "Email", "value": email, "inline": False},
+                            {"name": "Email", "value": masked_email, "inline": False},
                             {"name": "Server", "value": guild.name, "inline": True}
                         ],
                         "timestamp": discord.utils.utcnow().isoformat()
@@ -757,7 +844,7 @@ async def handle_callback(request):
                 async with aiohttp.ClientSession() as webhook_session:
                     await webhook_session.post(WEBHOOK_URL, json=webhook_embed)
             except Exception as e:
-                print(f'Error sending webhook: {e}')
+                logger.error(f'Error sending webhook: {e}')
         
         try:
             embed = discord.Embed(color=discord.Color.green())
@@ -771,7 +858,10 @@ async def handle_callback(request):
             pass
         
         del pending_verifications[user_id]
-        print(f'✅ Verified: {username} ({user_id}) - Email: {email}')
+        
+        # Masked logging
+        masked_email_log = email[:2] + '***@' + email.split('@')[1] if '@' in email else '***'
+        logger.info(f'✅ Verified: {username} ({user_id}) - Email: {masked_email_log}')
         
         return web.Response(
             text=f'''
@@ -788,7 +878,7 @@ async def handle_callback(request):
         )
         
     except Exception as e:
-        print(f'Error in callback: {e}')
+        logger.error(f'Error in callback: {e}')
         return web.Response(text=f'Error: {str(e)}', content_type='text/html')
 
 
@@ -806,15 +896,20 @@ async def start_web_server():
     app.router.add_get('/api/leaderboard', handle_vc_leaderboard)
     app.router.add_get('/api/current', handle_vc_current)
     
-    # Enable CORS
+    # CORS middleware with security
     @web.middleware
     async def cors_middleware(request, handler):
+        origin = request.headers.get('Origin', '')
+        
         if request.method == "OPTIONS":
             response = web.Response()
         else:
             response = await handler(request)
         
-        response.headers['Access-Control-Allow-Origin'] = '*'
+        # Only allow specific origins in production
+        if '*' in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS:
+            response.headers['Access-Control-Allow-Origin'] = origin or '*'
+        
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
         return response
@@ -828,31 +923,35 @@ async def start_web_server():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     
-    print(f'🌐 Web server started on port {port}')
-    print(f'📊 API endpoints:')
-    print(f'   - GET /api/leaderboard')
-    print(f'   - GET /api/current')
-    print(f'   - GET /health')
+    logger.info(f'🌐 Web server started on port {port}')
+    logger.info(f'📊 API endpoints:')
+    logger.info(f'   - GET /api/leaderboard')
+    logger.info(f'   - GET /api/current')
+    logger.info(f'   - GET /health')
 
 
 # ===== BOT READY EVENT =====
 @bot.event
 async def on_ready():
-    print(f'🤖 Bot logged in as {bot.user}')
+    logger.info(f'🤖 Bot logged in as {bot.user}')
     
     # Initialize database
     init_db()
     
-    # Your other on_ready code here...
+    # Start background tasks
+    bot.loop.create_task(cleanup_pending_verifications())
     
+    # Setup persistent views
     bot.add_view(VerifyButton())
+    
+    # Start web server
     asyncio.create_task(start_web_server())
     
     try:
         synced = await bot.tree.sync()
-        print(f'✅ Synced {len(synced)} slash command(s)')
+        logger.info(f'✅ Synced {len(synced)} slash command(s)')
     except Exception as e:
-        print(f'❌ Error syncing commands: {e}')
+        logger.error(f'❌ Error syncing commands: {e}')
 
 
 # ===== MAIN FUNCTION =====
@@ -864,14 +963,20 @@ async def main():
     while retry_count < max_retries:
         try:
             await bot.start(BOT_TOKEN)
+        except discord.errors.HTTPException as e:
+            if e.status == 429:
+                logger.error(f'❌ Rate limited! Waiting before retry...')
+                wait_time = min(300, 60 * (retry_count + 1))
+                await asyncio.sleep(wait_time)
+            retry_count += 1
         except Exception as e:
             retry_count += 1
             wait_time = min(60 * retry_count, 300)
-            print(f'❌ Bot crashed! Retry {retry_count}/{max_retries} in {wait_time}s')
-            print(f'Error: {e}')
+            logger.error(f'❌ Bot crashed! Retry {retry_count}/{max_retries} in {wait_time}s')
+            logger.error(f'Error: {e}')
             await asyncio.sleep(wait_time)
     
-    print('💀 Max retries reached. Bot stopped.')
+    logger.error('💀 Max retries reached. Bot stopped.')
 
 
 # ===== RUN BOT =====
@@ -879,6 +984,6 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print('⛔ Bot stopped by user')
+        logger.info('⛔ Bot stopped by user')
     except Exception as e:
-        print(f'💥 Fatal error: {e}')
+        logger.error(f'💥 Fatal error: {e}')
