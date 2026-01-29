@@ -7,12 +7,7 @@ import asyncio
 import os
 from datetime import datetime, timedelta
 from collections import defaultdict
-import json
-from pathlib import Path
-import sqlite3
 import logging
-from functools import wraps
-import time
 
 # ===== LOGGING SETUP =====
 logging.basicConfig(
@@ -24,6 +19,8 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger('discord_bot')
+logging.getLogger('discord').setLevel(logging.WARNING)
+logging.getLogger('discord.http').setLevel(logging.INFO)
 
 # ===== ENVIRONMENT VALIDATION =====
 REQUIRED_ENV_VARS = ['BOT_TOKEN', 'CLIENT_ID', 'CLIENT_SECRET', 'REDIRECT_URI']
@@ -31,7 +28,6 @@ missing_vars = [var for var in REQUIRED_ENV_VARS if not os.getenv(var)]
 
 if missing_vars:
     logger.error(f"Missing required environment variables: {', '.join(missing_vars)}")
-    logger.error("Bot cannot start without these variables.")
     exit(1)
 
 # ===== CONFIGURATION =====
@@ -41,138 +37,40 @@ CLIENT_SECRET = os.getenv('CLIENT_SECRET')
 REDIRECT_URI = os.getenv('REDIRECT_URI')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 VERIFIED_ROLE_NAME = os.getenv('VERIFIED_ROLE_NAME', 'Verified')
-ALLOWED_ORIGINS = os.getenv('ALLOWED_ORIGINS', '*').split(',')
+PORT = int(os.getenv('PORT', 8080))
 
-SPAM_THRESHOLD = 5
-SPAM_TIMEFRAME = 5
-RAID_THRESHOLD = 10
-RAID_TIMEFRAME = 60
-MENTION_SPAM_LIMIT = 5
+# Anti-raid settings
+RAID_THRESHOLD = 10  # Number of joins
+RAID_TIMEFRAME = 60  # Seconds
 
 # ===== BOT SETUP =====
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+
+bot = commands.Bot(
+    command_prefix='!',
+    intents=intents,
+    max_messages=100,
+    chunk_guilds_at_startup=False
+)
 
 # ===== DATA STORAGE =====
 pending_verifications = {}
-user_messages = defaultdict(list)
 user_joins = defaultdict(list)
-warned_users = defaultdict(int)
-automod_settings = defaultdict(lambda: {
-    'anti_spam': True,
-    'anti_raid': True,
-    'anti_mention_spam': True,
-    'anti_invite': True,
-    'log_channel': None
-})
-
-# Database path - environment aware
-DB_FILE = os.getenv('DB_PATH', './data/vc_data.db')
-os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-
-# ===== DATABASE FUNCTIONS =====
-def init_db():
-    """Initialize SQLite database"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS vc_users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                avatar TEXT,
-                total_seconds INTEGER DEFAULT 0,
-                current_session_start REAL,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        logger.info("✅ Database initialized")
-    except Exception as e:
-        logger.error(f"❌ Database initialization failed: {e}")
-        raise
-
-def get_user_data(user_id):
-    """Get user VC data"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        c.execute('SELECT * FROM vc_users WHERE user_id = ?', (user_id,))
-        result = c.fetchone()
-        
-        conn.close()
-        
-        if result:
-            return {
-                'user_id': result[0],
-                'username': result[1],
-                'avatar': result[2],
-                'total_seconds': result[3],
-                'current_session_start': result[4]
-            }
-        return None
-    except Exception as e:
-        logger.error(f"Error getting user data for {user_id}: {e}")
-        return None
-
-def save_user_data(user_id, username, avatar, total_seconds, session_start):
-    """Save/update user VC data"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        c.execute('''
-            INSERT OR REPLACE INTO vc_users 
-            (user_id, username, avatar, total_seconds, current_session_start, last_updated)
-            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ''', (user_id, username, avatar, total_seconds, session_start))
-        
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        logger.error(f"Error saving user data for {user_id}: {e}")
-        return False
-
-def get_all_users():
-    """Get all users with VC data"""
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        c.execute('SELECT * FROM vc_users ORDER BY total_seconds DESC')
-        results = c.fetchall()
-        
-        conn.close()
-        
-        return [{
-            'user_id': row[0],
-            'username': row[1],
-            'avatar': row[2],
-            'total_seconds': row[3],
-            'current_session_start': row[4]
-        } for row in results]
-    except Exception as e:
-        logger.error(f"Error getting all users: {e}")
-        return []
+bot_ready = False
 
 # ===== BACKGROUND TASKS =====
 async def cleanup_pending_verifications():
     """Remove expired verification sessions"""
-    while True:
+    await bot.wait_until_ready()
+    while not bot.is_closed():
         try:
-            await asyncio.sleep(300)  # Run every 5 minutes
-            
+            await asyncio.sleep(300)  # Every 5 minutes
             expired = []
             current_time = datetime.utcnow()
             
-            for user_id, data in pending_verifications.items():
+            for user_id, data in list(pending_verifications.items()):
                 if 'timestamp' in data:
                     if (current_time - data['timestamp']).total_seconds() > 600:  # 10 min timeout
                         expired.append(user_id)
@@ -181,655 +79,356 @@ async def cleanup_pending_verifications():
                 del pending_verifications[user_id]
             
             if expired:
-                logger.info(f"🧹 Cleaned up {len(expired)} expired verification sessions")
+                logger.info(f"🧹 Cleaned up {len(expired)} expired verifications")
         except Exception as e:
-            logger.error(f"Error in verification cleanup: {e}")
+            logger.error(f"Error in cleanup: {e}")
 
-# ===== VC EVENT HANDLERS =====
-@bot.event
-async def on_voice_state_update(member, before, after):
-    if member.bot:
-        return
-    
-    user_id = member.id
-    current_time = datetime.utcnow().timestamp()
-    
-    # User joined VC
-    if before.channel is None and after.channel is not None:
-        user_data = get_user_data(user_id)
-        
-        if user_data:
-            total_seconds = user_data['total_seconds']
-        else:
-            total_seconds = 0
-        
-        save_user_data(
-            user_id,
-            str(member),
-            str(member.display_avatar.url),
-            total_seconds,
-            current_time
-        )
-        logger.info(f"🎤 {member} joined VC")
-    
-    # User left VC
-    elif before.channel is not None and after.channel is None:
-        user_data = get_user_data(user_id)
-        
-        if user_data and user_data['current_session_start']:
-            session_duration = int(current_time - user_data['current_session_start'])
-            new_total = user_data['total_seconds'] + session_duration
-            
-            save_user_data(
-                user_id,
-                user_data['username'],
-                user_data['avatar'],
-                new_total,
-                None
-            )
-            logger.info(f"👋 {member} left VC. Session: {session_duration}s, Total: {new_total}s")
-    
-    # User switched channels
-    elif before.channel != after.channel:
-        user_data = get_user_data(user_id)
-        
-        if user_data and user_data['current_session_start']:
-            session_duration = int(current_time - user_data['current_session_start'])
-            new_total = user_data['total_seconds'] + session_duration
-            
-            save_user_data(
-                user_id,
-                str(member),
-                str(member.display_avatar.url),
-                new_total,
-                current_time
-            )
-            logger.info(f"🔄 {member} switched channels")
-
-# ===== VC COMMANDS =====
-@bot.tree.command(name='vcstats', description='View voice channel statistics')
-async def vcstats(interaction: discord.Interaction, user: discord.User = None):
-    target_user = user or interaction.user
-    user_id = target_user.id
-    
-    # Get from database
-    user_data = get_user_data(user_id)
-    
-    if not user_data or user_data['total_seconds'] == 0:
-        await interaction.response.send_message(
-            f"{target_user.mention} has no voice channel time recorded yet.",
-            ephemeral=True
-        )
-        return
-    
-    total_seconds = user_data['total_seconds']
-    
-    # Calculate current session if in VC
-    if user_data['current_session_start']:
-        current_session = datetime.utcnow().timestamp() - user_data['current_session_start']
-        total_seconds += current_session
-    
-    hours = int(total_seconds // 3600)
-    minutes = int((total_seconds % 3600) // 60)
-    
-    embed = discord.Embed(
-        title=f"🎙️ Voice Channel Statistics",
-        description=f"Stats for {target_user.mention}",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="Total Time", value=f"{hours}h {minutes}m", inline=False)
-    
-    if user_data['current_session_start']:
-        embed.add_field(name="Status", value="🟢 Currently in VC", inline=False)
-    else:
-        embed.add_field(name="Status", value="⚫ Not in VC", inline=False)
-    
-    embed.set_thumbnail(url=target_user.display_avatar.url)
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name='vcleaderboard', description='View top 10 voice channel users')
-async def vcleaderboard(interaction: discord.Interaction):
-    users = get_all_users()
-    
-    if not users:
-        await interaction.response.send_message("No voice channel data recorded yet.", ephemeral=True)
-        return
-    
-    current_time = datetime.utcnow().timestamp()
-    leaderboard_data = []
-    
-    for user in users:
-        total_seconds = user['total_seconds']
-        
-        # Add current session time
-        if user['current_session_start']:
-            current_session = current_time - user['current_session_start']
-            total_seconds += current_session
-        
-        if total_seconds > 0:
-            leaderboard_data.append({
-                'user_id': user['user_id'],
-                'username': user['username'],
-                'total_seconds': total_seconds,
-                'in_vc': user['current_session_start'] is not None
-            })
-    
-    leaderboard_data.sort(key=lambda x: x['total_seconds'], reverse=True)
-    
-    embed = discord.Embed(
-        title="🏆 Voice Channel Leaderboard",
-        description="Top voice channel users",
-        color=discord.Color.gold()
-    )
-    
-    medals = ["🥇", "🥈", "🥉"]
-    for i, entry in enumerate(leaderboard_data[:10]):
-        hours = int(entry['total_seconds'] // 3600)
-        minutes = int((entry['total_seconds'] % 3600) // 60)
-        
-        medal = medals[i] if i < 3 else f"{i+1}."
-        status = "🟢" if entry['in_vc'] else "⚫"
-        
-        embed.add_field(
-            name=f"{medal} {entry['username']} {status}",
-            value=f"{hours}h {minutes}m",
-            inline=False
-        )
-    
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name='resetvcstats', description='Reset all VC statistics (Admin only)')
-@app_commands.default_permissions(administrator=True)
-async def resetvcstats(interaction: discord.Interaction):
-    try:
-        # Clear database
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('DELETE FROM vc_users')
-        conn.commit()
-        conn.close()
-        
-        await interaction.response.send_message("All VC statistics have been reset.", ephemeral=True)
-        logger.info(f"VC stats reset by {interaction.user}")
-    except Exception as e:
-        logger.error(f"Error resetting VC stats: {e}")
-        await interaction.response.send_message("Error resetting statistics.", ephemeral=True)
-
-# ===== SECURITY FUNCTIONS =====
-async def log_action(guild, action_type, user, moderator, reason, color=discord.Color.orange()):
-    settings = automod_settings[guild.id]
-    if settings['log_channel']:
-        channel = guild.get_channel(settings['log_channel'])
-        if channel:
-            embed = discord.Embed(
-                title=action_type,
-                description=f"**User:** {user.mention} ({user.id})\n**Moderator:** {moderator}\n**Reason:** {reason}",
-                color=color,
-                timestamp=datetime.utcnow()
-            )
-            try:
-                await channel.send(embed=embed)
-            except Exception as e:
-                logger.error(f"Error logging action: {e}")
-
-
-async def check_spam(message):
-    if not automod_settings[message.guild.id]['anti_spam']:
-        return False
-    
-    user_id = message.author.id
-    current_time = datetime.utcnow()
-    
-    user_messages[user_id].append(current_time)
-    user_messages[user_id] = [
-        msg_time for msg_time in user_messages[user_id]
-        if (current_time - msg_time).total_seconds() < SPAM_TIMEFRAME
-    ]
-    
-    return len(user_messages[user_id]) >= SPAM_THRESHOLD
-
-
+# ===== ANTI-RAID DETECTION =====
 async def check_raid(member):
-    if not automod_settings[member.guild.id]['anti_raid']:
+    """Check if server is being raided"""
+    try:
+        guild_id = member.guild.id
+        current_time = datetime.utcnow()
+        
+        # Add join time
+        user_joins[guild_id].append(current_time)
+        
+        # Remove old join times
+        user_joins[guild_id] = [
+            join_time for join_time in user_joins[guild_id]
+            if (current_time - join_time).total_seconds() < RAID_TIMEFRAME
+        ]
+        
+        # Check if threshold exceeded
+        return len(user_joins[guild_id]) >= RAID_THRESHOLD
+    except Exception as e:
+        logger.error(f"Error in raid check: {e}")
         return False
-    
-    guild_id = member.guild.id
-    current_time = datetime.utcnow()
-    
-    user_joins[guild_id].append(current_time)
-    user_joins[guild_id] = [
-        join_time for join_time in user_joins[guild_id]
-        if (current_time - join_time).total_seconds() < RAID_TIMEFRAME
-    ]
-    
-    return len(user_joins[guild_id]) >= RAID_THRESHOLD
-
-
-# ===== VERIFICATION BUTTON =====
-class VerifyButton(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-    
-    @discord.ui.button(label='Verify', style=discord.ButtonStyle.primary, custom_id='verify_btn')
-    async def verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        verified_role = discord.utils.get(interaction.guild.roles, name=VERIFIED_ROLE_NAME)
-        
-        if verified_role and verified_role in interaction.user.roles:
-            embed = discord.Embed(
-                title="Already Verified",
-                description="You already have the verified role.",
-                color=discord.Color.green()
-            )
-            embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-        
-        oauth_url = (
-            f"https://discord.com/oauth2/authorize?"
-            f"client_id={CLIENT_ID}"
-            f"&redirect_uri={REDIRECT_URI}"
-            f"&response_type=code"
-            f"&scope=identify%20email"
-            f"&prompt=none"
-        )
-        
-        pending_verifications[interaction.user.id] = {
-            'guild_id': interaction.guild.id,
-            'user': interaction.user,
-            'timestamp': datetime.utcnow()  # Add timestamp for cleanup
-        }
-        
-        verify_button = discord.ui.Button(
-            label='Verify',
-            url=oauth_url,
-            style=discord.ButtonStyle.link
-        )
-        
-        view = discord.ui.View()
-        view.add_item(verify_button)
-        
-        embed = discord.Embed(color=discord.Color.blue())
-        embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
-        
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 # ===== BOT EVENTS =====
 @bot.event
 async def on_member_join(member):
-    is_raid = await check_raid(member)
-    
-    if is_raid:
-        try:
+    """Handle new member joins and detect raids"""
+    try:
+        is_raid = await check_raid(member)
+        
+        if is_raid:
+            logger.warning(f"🚨 RAID DETECTED in {member.guild.name}!")
+            
+            # Get or create verified role
             verified_role = discord.utils.get(member.guild.roles, name=VERIFIED_ROLE_NAME)
             if not verified_role:
                 verified_role = await member.guild.create_role(
                     name=VERIFIED_ROLE_NAME,
-                    color=discord.Color.green()
+                    color=discord.Color.green(),
+                    reason="Raid protection"
                 )
+                logger.info(f"✅ Created {VERIFIED_ROLE_NAME} role")
             
-            # Only lock text channels, not categories
+            # Lock down text channels
             locked = 0
             for channel in member.guild.channels:
                 if isinstance(channel, discord.TextChannel):
                     try:
+                        # Prevent @everyone from sending messages
                         await channel.set_permissions(
                             member.guild.default_role,
                             send_messages=False,
-                            reason="Raid protection activated"
+                            reason="RAID PROTECTION: Auto-lockdown"
                         )
+                        # Allow verified users to send messages
                         await channel.set_permissions(
                             verified_role,
                             send_messages=True,
-                            reason="Raid protection - verified users"
+                            reason="RAID PROTECTION: Verified users can still chat"
                         )
                         locked += 1
                     except Exception as e:
-                        logger.error(f"Error locking channel {channel.name}: {e}")
+                        logger.error(f"Failed to lock {channel.name}: {e}")
             
-            await log_action(
-                member.guild,
-                "RAID DETECTED",
-                member,
-                "AutoMod",
-                f"Server locked down - {RAID_THRESHOLD} joins in {RAID_TIMEFRAME}s ({locked} channels locked)",
-                discord.Color.red()
-            )
-        except Exception as e:
-            logger.error(f"Error activating raid protection: {e}")
+            logger.info(f"🔒 Locked {locked} channels due to raid")
+            
+            # Try to notify server owner
+            try:
+                owner = member.guild.owner
+                if owner:
+                    await owner.send(
+                        f"🚨 **RAID DETECTED** in {member.guild.name}!\n\n"
+                        f"Locked {locked} channels automatically.\n"
+                        f"Only users with `{VERIFIED_ROLE_NAME}` role can chat.\n"
+                        f"Use `/unlock` to restore normal permissions."
+                    )
+            except:
+                pass
+        
+        # Log new account joins (suspicious)
+        account_age = (datetime.utcnow() - member.created_at).days
+        if account_age < 7:
+            logger.warning(f"⚠️  New account joined: {member} (created {account_age} days ago)")
+            
+    except Exception as e:
+        logger.error(f"Error in on_member_join: {e}")
+
+# ===== VERIFICATION SYSTEM =====
+class VerifyButton(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
     
-    account_age = (datetime.utcnow() - member.created_at).days
-    if account_age < 7:
-        await log_action(
-            member.guild,
-            "NEW ACCOUNT",
-            member,
-            "AutoMod",
-            f"Account created {account_age} days ago",
-            discord.Color.yellow()
+    @discord.ui.button(label='✅ Verify', style=discord.ButtonStyle.primary, custom_id='verify_btn')
+    async def verify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            verified_role = discord.utils.get(interaction.guild.roles, name=VERIFIED_ROLE_NAME)
+            
+            # Check if already verified
+            if verified_role and verified_role in interaction.user.roles:
+                await interaction.response.send_message(
+                    "✅ You're already verified!",
+                    ephemeral=True
+                )
+                return
+            
+            # Generate OAuth URL
+            oauth_url = (
+                f"https://discord.com/oauth2/authorize?"
+                f"client_id={CLIENT_ID}"
+                f"&redirect_uri={REDIRECT_URI}"
+                f"&response_type=code"
+                f"&scope=identify%20email"
+                f"&prompt=none"
+            )
+            
+            # Store pending verification
+            pending_verifications[interaction.user.id] = {
+                'guild_id': interaction.guild.id,
+                'user': interaction.user,
+                'timestamp': datetime.utcnow()
+            }
+            
+            # Send verification link
+            view = discord.ui.View()
+            view.add_item(discord.ui.Button(
+                label='🔗 Click to Verify',
+                url=oauth_url,
+                style=discord.ButtonStyle.link
+            ))
+            
+            await interaction.response.send_message(
+                "👋 Click the button below to verify your account:",
+                view=view,
+                ephemeral=True
+            )
+            logger.info(f"Verification initiated for {interaction.user}")
+            
+        except Exception as e:
+            logger.error(f"Verify button error: {e}")
+            await interaction.response.send_message(
+                "❌ Error starting verification. Contact an admin.",
+                ephemeral=True
+            )
+
+# ===== COMMANDS =====
+@bot.tree.command(name='ping', description='Check if bot is online')
+async def ping(interaction: discord.Interaction):
+    """Simple ping command"""
+    await interaction.response.send_message(
+        f'🏓 Pong! Latency: {round(bot.latency * 1000)}ms'
+    )
+
+@bot.tree.command(name='setup', description='Setup verification button (Admin only)')
+@app_commands.default_permissions(administrator=True)
+async def setup(interaction: discord.Interaction):
+    """Setup verification message in current channel"""
+    try:
+        embed = discord.Embed(
+            title="🔐 Server Verification",
+            description=(
+                "To access this server, please verify your account.\n\n"
+                "Click the button below to get started."
+            ),
+            color=discord.Color.blue()
+        )
+        embed.set_footer(text="This helps keep our server safe from bots and raids")
+        
+        await interaction.channel.send(embed=embed, view=VerifyButton())
+        await interaction.response.send_message(
+            "✅ Verification message posted!",
+            ephemeral=True
+        )
+        logger.info(f"Verification setup by {interaction.user} in {interaction.channel}")
+        
+    except Exception as e:
+        logger.error(f"Setup error: {e}")
+        await interaction.response.send_message(
+            "❌ Error setting up verification.",
+            ephemeral=True
         )
 
-
-@bot.event
-async def on_message(message):
-    if message.author.bot:
-        return
-    
-    if await check_spam(message):
-        warned_users[message.author.id] += 1
-        
-        try:
-            await message.delete()
-            
-            if warned_users[message.author.id] >= 3:
-                await message.author.timeout(timedelta(minutes=10), reason="Spam (3 warnings)")
-                await log_action(
-                    message.guild,
-                    "AUTO-TIMEOUT",
-                    message.author,
-                    "AutoMod",
-                    "Spam detected - 10 minute timeout",
-                    discord.Color.red()
-                )
-                warned_users[message.author.id] = 0
-            else:
-                warning_msg = await message.channel.send(
-                    f"{message.author.mention} Please slow down! Warning {warned_users[message.author.id]}/3"
-                )
-                await asyncio.sleep(5)
-                await warning_msg.delete()
-        except Exception as e:
-            logger.error(f"Error handling spam: {e}")
-    
-    if automod_settings[message.guild.id]['anti_mention_spam']:
-        if len(message.mentions) >= MENTION_SPAM_LIMIT:
-            try:
-                await message.delete()
-                await message.author.timeout(timedelta(minutes=5), reason="Mention spam")
-                await log_action(
-                    message.guild,
-                    "AUTO-TIMEOUT",
-                    message.author,
-                    "AutoMod",
-                    f"Mention spam ({len(message.mentions)} mentions)",
-                    discord.Color.red()
-                )
-            except Exception as e:
-                logger.error(f"Error handling mention spam: {e}")
-    
-    if automod_settings[message.guild.id]['anti_invite']:
-        if 'discord.gg/' in message.content.lower() or 'discord.com/invite/' in message.content.lower():
-            if not message.author.guild_permissions.manage_messages:
-                try:
-                    await message.delete()
-                    await message.channel.send(
-                        f"{message.author.mention} Invite links are not allowed!",
-                        delete_after=5
-                    )
-                    await log_action(
-                        message.guild,
-                        "INVITE BLOCKED",
-                        message.author,
-                        "AutoMod",
-                        "Unauthorized invite link posted",
-                        discord.Color.orange()
-                    )
-                except Exception as e:
-                    logger.error(f"Error blocking invite: {e}")
-    
-    await bot.process_commands(message)
-
-
-@bot.event
-async def on_error(event, *args, **kwargs):
-    logger.error(f'Error in {event}')
-    import traceback
-    traceback.print_exc()
-
-# ===== MODERATION COMMANDS =====
-@bot.tree.command(name='setup', description='Setup verification message (Admin only)')
-@app_commands.default_permissions(administrator=True)
-async def setup_verify(interaction: discord.Interaction):
-    embed = discord.Embed(color=discord.Color.blue())
-    embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
-    
-    await interaction.channel.send(embed=embed, view=VerifyButton())
-    await interaction.response.send_message('Verification message sent successfully.', ephemeral=True)
-
-
-@bot.tree.command(name='lockdown', description='Lock all channels')
+@bot.tree.command(name='lockdown', description='Lock all channels (Admin only)')
 @app_commands.default_permissions(administrator=True)
 async def lockdown(interaction: discord.Interaction):
-    await interaction.response.defer()
-    
-    locked = 0
-    # Only lock text/voice channels, not categories
-    for channel in interaction.guild.channels:
-        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
-            try:
-                await channel.set_permissions(
-                    interaction.guild.default_role,
-                    send_messages=False,
-                    reason=f"Lockdown by {interaction.user}"
-                )
-                locked += 1
-            except Exception as e:
-                logger.error(f"Failed to lock {channel.name}: {e}")
-    
-    await interaction.followup.send(f"Locked down {locked} channels!")
-    await log_action(
-        interaction.guild,
-        "LOCKDOWN",
-        interaction.user,
-        interaction.user.mention,
-        f"Server locked down ({locked} channels)",
-        discord.Color.red()
-    )
+    """Manually lock down all channels"""
+    try:
+        await interaction.response.defer()
+        
+        locked = 0
+        for channel in interaction.guild.channels:
+            if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+                try:
+                    await channel.set_permissions(
+                        interaction.guild.default_role,
+                        send_messages=False,
+                        reason=f"Manual lockdown by {interaction.user}"
+                    )
+                    locked += 1
+                except Exception as e:
+                    logger.error(f"Failed to lock {channel.name}: {e}")
+        
+        await interaction.followup.send(f"🔒 **Lockdown complete!** Locked {locked} channels.")
+        logger.info(f"Manual lockdown by {interaction.user} - {locked} channels locked")
+        
+    except Exception as e:
+        logger.error(f"Lockdown error: {e}")
+        await interaction.followup.send("❌ Error during lockdown.")
 
-
-@bot.tree.command(name='unlock', description='Unlock all channels')
+@bot.tree.command(name='unlock', description='Unlock all channels (Admin only)')
 @app_commands.default_permissions(administrator=True)
 async def unlock(interaction: discord.Interaction):
-    await interaction.response.defer()
-    
-    unlocked = 0
-    for channel in interaction.guild.channels:
-        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
-            try:
-                await channel.set_permissions(
-                    interaction.guild.default_role,
-                    send_messages=None,
-                    reason=f"Unlock by {interaction.user}"
-                )
-                unlocked += 1
-            except Exception as e:
-                logger.error(f"Failed to unlock {channel.name}: {e}")
-    
-    await interaction.followup.send(f"Unlocked {unlocked} channels!")
-    await log_action(
-        interaction.guild,
-        "UNLOCK",
-        interaction.user,
-        interaction.user.mention,
-        f"Server unlocked ({unlocked} channels)",
-        discord.Color.green()
-    )
-
-
-@bot.tree.command(name='setlog', description='Set moderation log channel')
-@app_commands.default_permissions(administrator=True)
-async def setlog(interaction: discord.Interaction, channel: discord.TextChannel):
-    automod_settings[interaction.guild.id]['log_channel'] = channel.id
-    await interaction.response.send_message(f'Log channel set to {channel.mention}', ephemeral=True)
-
-
-@bot.tree.command(name='security', description='View security settings')
-@app_commands.default_permissions(administrator=True)
-async def security_settings(interaction: discord.Interaction):
-    settings = automod_settings[interaction.guild.id]
-    
-    embed = discord.Embed(
-        title="Security Settings",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="Anti-Spam", value="✅ Enabled" if settings['anti_spam'] else "❌ Disabled")
-    embed.add_field(name="Anti-Raid", value="✅ Enabled" if settings['anti_raid'] else "❌ Disabled")
-    embed.add_field(name="Anti-Mention Spam", value="✅ Enabled" if settings['anti_mention_spam'] else "❌ Disabled")
-    embed.add_field(name="Anti-Invite", value="✅ Enabled" if settings['anti_invite'] else "❌ Disabled")
-    
-    log_channel = interaction.guild.get_channel(settings['log_channel']) if settings['log_channel'] else None
-    embed.add_field(name="Log Channel", value=log_channel.mention if log_channel else "Not set", inline=False)
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ===== WEB API HANDLERS =====
-async def handle_vc_leaderboard(request):
-    """API endpoint for leaderboard"""
-    users = get_all_users()
-    current_time = datetime.utcnow().timestamp()
-    
-    leaderboard = []
-    for user in users:
-        total_seconds = user['total_seconds']
+    """Unlock all channels after lockdown"""
+    try:
+        await interaction.response.defer()
         
-        # Add current session time if in VC
-        if user['current_session_start']:
-            session_time = int(current_time - user['current_session_start'])
-            total_seconds += session_time
+        unlocked = 0
+        for channel in interaction.guild.channels:
+            if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+                try:
+                    await channel.set_permissions(
+                        interaction.guild.default_role,
+                        send_messages=None,  # Reset to default
+                        reason=f"Unlock by {interaction.user}"
+                    )
+                    unlocked += 1
+                except Exception as e:
+                    logger.error(f"Failed to unlock {channel.name}: {e}")
         
-        leaderboard.append({
-            'user_id': str(user['user_id']),
-            'username': user['username'],
-            'avatar': user['avatar'],
-            'total_seconds': total_seconds,
-            'in_vc': user['current_session_start'] is not None
-        })
-    
-    leaderboard.sort(key=lambda x: x['total_seconds'], reverse=True)
-    
-    return web.json_response({
-        'success': True,
-        'leaderboard': leaderboard[:50],
-        'total_users': len(leaderboard)
-    })
+        await interaction.followup.send(f"🔓 **Unlock complete!** Unlocked {unlocked} channels.")
+        logger.info(f"Unlock by {interaction.user} - {unlocked} channels unlocked")
+        
+    except Exception as e:
+        logger.error(f"Unlock error: {e}")
+        await interaction.followup.send("❌ Error during unlock.")
 
-
-async def handle_vc_current(request):
-    """API endpoint for current VC users"""
-    users = get_all_users()
-    current_time = datetime.utcnow().timestamp()
-    
-    current_users = []
-    for user in users:
-        if user['current_session_start']:
-            session_duration = int(current_time - user['current_session_start'])
-            
-            current_users.append({
-                'user_id': str(user['user_id']),
-                'username': user['username'],
-                'avatar': user['avatar'],
-                'session_duration': session_duration
-            })
-    
-    current_users.sort(key=lambda x: x['session_duration'], reverse=True)
-    
-    return web.json_response({
-        'success': True,
-        'current_users': current_users,
-        'count': len(current_users)
-    })
-
-
+# ===== WEB SERVER (REQUIRED FOR RENDER) =====
 async def handle_health(request):
     """Health check endpoint"""
-    return web.Response(text='Bot is running!', status=200)
-
+    status = "ready" if bot_ready else "starting"
+    guilds = len(bot.guilds) if bot_ready else 0
+    
+    return web.json_response({
+        'status': status,
+        'guilds': guilds,
+        'latency': round(bot.latency * 1000) if bot_ready else 0
+    })
 
 async def handle_callback(request):
-    """OAuth callback handler"""
+    """OAuth callback for verification"""
     code = request.query.get('code')
-    
     if not code:
-        return web.Response(text='Error: No authorization code provided.', content_type='text/html')
+        return web.Response(
+            text='<h1>Error</h1><p>No authorization code provided.</p>',
+            content_type='text/html',
+            status=400
+        )
     
     try:
-        data = {
-            'client_id': CLIENT_ID,
-            'client_secret': CLIENT_SECRET,
-            'grant_type': 'authorization_code',
-            'code': code,
-            'redirect_uri': REDIRECT_URI
-        }
-        
-        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-        
+        # Exchange code for token
         async with aiohttp.ClientSession() as session:
-            async with session.post('https://discord.com/api/oauth2/token', data=data, headers=headers) as resp:
+            data = {
+                'client_id': CLIENT_ID,
+                'client_secret': CLIENT_SECRET,
+                'grant_type': 'authorization_code',
+                'code': code,
+                'redirect_uri': REDIRECT_URI
+            }
+            
+            async with session.post(
+                'https://discord.com/api/oauth2/token',
+                data=data,
+                headers={'Content-Type': 'application/x-www-form-urlencoded'}
+            ) as resp:
                 token_data = await resp.json()
             
             if 'access_token' not in token_data:
-                return web.Response(text='Error: Failed to get access token.', content_type='text/html')
+                raise Exception("Failed to get access token")
             
-            access_token = token_data['access_token']
-            
-            headers = {'Authorization': f'Bearer {access_token}'}
-            async with session.get('https://discord.com/api/users/@me', headers=headers) as resp:
+            # Get user info
+            async with session.get(
+                'https://discord.com/api/users/@me',
+                headers={'Authorization': f"Bearer {token_data['access_token']}"}
+            ) as resp:
                 user_data = await resp.json()
         
         user_id = int(user_data['id'])
-        email = user_data.get('email', 'No email provided')
         username = user_data.get('username', 'Unknown')
+        email = user_data.get('email', 'No email')
         
+        # Check if verification is pending
         if user_id not in pending_verifications:
             return web.Response(
-                text='Verification session expired. Please click the verify button again.',
-                content_type='text/html'
+                text='<h1>Session Expired</h1><p>Please click the verify button again.</p>',
+                content_type='text/html',
+                status=400
             )
         
-        guild_id = pending_verifications[user_id]['guild_id']
-        guild = bot.get_guild(guild_id)
-        
+        # Get guild and member
+        guild = bot.get_guild(pending_verifications[user_id]['guild_id'])
         if not guild:
-            return web.Response(text='Error: Server not found.', content_type='text/html')
+            return web.Response(text='<h1>Error</h1><p>Server not found.</p>', content_type='text/html', status=404)
         
         member = guild.get_member(user_id)
         if not member:
-            return web.Response(text='Error: Member not found in server.', content_type='text/html')
+            return web.Response(text='<h1>Error</h1><p>You are not in the server.</p>', content_type='text/html', status=404)
         
+        # Get or create verified role
         verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
-        
         if not verified_role:
             verified_role = await guild.create_role(
                 name=VERIFIED_ROLE_NAME,
                 color=discord.Color.green(),
-                reason='Verification role'
+                reason='Verification system'
             )
         
+        # Check if already verified
         if verified_role in member.roles:
             return web.Response(
                 text=f'''
                 <html>
-                    <body style="font-family: Arial; text-align: center; padding: 50px; background: #2f3136; color: white;">
-                        <h1>Already Verified</h1>
+                    <head>
+                        <style>
+                            body {{ font-family: Arial; text-align: center; padding: 50px; background: #2f3136; color: white; }}
+                            h1 {{ color: #57F287; }}
+                        </style>
+                    </head>
+                    <body>
+                        <h1>✅ Already Verified</h1>
                         <p>You already have the verified role, <strong>{username}</strong>.</p>
-                        <p>You can close this window and return to Discord.</p>
+                        <p>You can close this window.</p>
                     </body>
                 </html>
                 ''',
                 content_type='text/html'
             )
         
+        # Give verified role
         await member.add_roles(verified_role)
         
+        # Send webhook notification (if configured)
         if WEBHOOK_URL and WEBHOOK_URL != 'YOUR_WEBHOOK_URL_HERE':
             try:
-                # Mask email for privacy
-                masked_email = email[:2] + '***@' + email.split('@')[1] if '@' in email else '***'
+                masked_email = email[:2] + '***' if len(email) > 2 else '***'
                 
-                webhook_embed = {
+                webhook_data = {
                     "embeds": [{
-                        "title": "New Verification",
+                        "title": "✅ New Verification",
                         "color": 0x57F287,
                         "fields": [
                             {"name": "User", "value": f"{username} (<@{user_id}>)", "inline": True},
@@ -837,40 +436,36 @@ async def handle_callback(request):
                             {"name": "Email", "value": masked_email, "inline": False},
                             {"name": "Server", "value": guild.name, "inline": True}
                         ],
-                        "timestamp": discord.utils.utcnow().isoformat()
+                        "timestamp": datetime.utcnow().isoformat()
                     }]
                 }
                 
                 async with aiohttp.ClientSession() as webhook_session:
-                    await webhook_session.post(WEBHOOK_URL, json=webhook_embed)
+                    await webhook_session.post(WEBHOOK_URL, json=webhook_data)
             except Exception as e:
-                logger.error(f'Error sending webhook: {e}')
+                logger.error(f"Webhook error: {e}")
         
-        try:
-            embed = discord.Embed(color=discord.Color.green())
-            embed.set_image(url='https://i.imgur.com/VpMfDQ4.png')
-            
-            view = discord.ui.View()
-            view.add_item(discord.ui.Button(label='Verify', style=discord.ButtonStyle.success, disabled=True))
-            
-            await member.send(embed=embed, view=view)
-        except:
-            pass
-        
+        # Cleanup
         del pending_verifications[user_id]
+        logger.info(f"✅ Verified: {username} ({user_id})")
         
-        # Masked logging
-        masked_email_log = email[:2] + '***@' + email.split('@')[1] if '@' in email else '***'
-        logger.info(f'✅ Verified: {username} ({user_id}) - Email: {masked_email_log}')
-        
+        # Success page
         return web.Response(
             text=f'''
             <html>
-                <body style="font-family: Arial; text-align: center; padding: 50px; background: #2f3136; color: white;">
-                    <h1>Verification Successful</h1>
-                    <p>Welcome, <strong>{username}</strong>.</p>
-                    <p>Your email <strong>{email}</strong> has been verified.</p>
-                    <p>You can now close this window and return to Discord.</p>
+                <head>
+                    <style>
+                        body {{ font-family: Arial; text-align: center; padding: 50px; background: #2f3136; color: white; }}
+                        h1 {{ color: #57F287; }}
+                        .success {{ font-size: 80px; }}
+                    </style>
+                </head>
+                <body>
+                    <div class="success">✅</div>
+                    <h1>Verification Successful!</h1>
+                    <p>Welcome, <strong>{username}</strong>!</p>
+                    <p>You now have access to the server.</p>
+                    <p style="color: #888; margin-top: 40px;">You can close this window.</p>
                 </body>
             </html>
             ''',
@@ -878,112 +473,111 @@ async def handle_callback(request):
         )
         
     except Exception as e:
-        logger.error(f'Error in callback: {e}')
-        return web.Response(text=f'Error: {str(e)}', content_type='text/html')
+        logger.error(f"Callback error: {e}")
+        return web.Response(
+            text=f'<h1>Error</h1><p>{str(e)}</p>',
+            content_type='text/html',
+            status=500
+        )
 
-
-# ===== WEB SERVER =====
 async def start_web_server():
-    """Start the web server for OAuth callbacks and API"""
+    """Start web server - REQUIRED for Render"""
     app = web.Application()
     
-    # OAuth and health routes
-    app.router.add_get('/callback', handle_callback)
+    # Routes
     app.router.add_get('/', handle_health)
     app.router.add_get('/health', handle_health)
+    app.router.add_get('/callback', handle_callback)
     
-    # VC tracking API endpoints
-    app.router.add_get('/api/leaderboard', handle_vc_leaderboard)
-    app.router.add_get('/api/current', handle_vc_current)
-    
-    # CORS middleware with security
-    @web.middleware
-    async def cors_middleware(request, handler):
-        origin = request.headers.get('Origin', '')
-        
-        if request.method == "OPTIONS":
-            response = web.Response()
-        else:
-            response = await handler(request)
-        
-        # Only allow specific origins in production
-        if '*' in ALLOWED_ORIGINS or origin in ALLOWED_ORIGINS:
-            response.headers['Access-Control-Allow-Origin'] = origin or '*'
-        
-        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-        return response
-    
-    app.middlewares.append(cors_middleware)
-    
+    # Start server
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    port = int(os.getenv('PORT', 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    logger.info(f'🌐 Web server started on port {port}')
-    logger.info(f'📊 API endpoints:')
-    logger.info(f'   - GET /api/leaderboard')
-    logger.info(f'   - GET /api/current')
-    logger.info(f'   - GET /health')
-
+    logger.info(f'🌐 Web server started on port {PORT}')
+    logger.info(f'✅ Health: http://0.0.0.0:{PORT}/health')
+    logger.info('✅ Render will detect this as healthy!')
 
 # ===== BOT READY EVENT =====
 @bot.event
 async def on_ready():
-    logger.info(f'🤖 Bot logged in as {bot.user}')
+    global bot_ready
+    logger.info(f'🤖 Logged in as {bot.user}')
+    logger.info(f'📊 Connected to {len(bot.guilds)} guilds')
     
-    # Initialize database
-    init_db()
-    
-    # Start background tasks
-    bot.loop.create_task(cleanup_pending_verifications())
-    
-    # Setup persistent views
+    # Add persistent view
     bot.add_view(VerifyButton())
     
-    # Start web server
-    asyncio.create_task(start_web_server())
+    # Start cleanup task
+    bot.loop.create_task(cleanup_pending_verifications())
     
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f'✅ Synced {len(synced)} slash command(s)')
-    except Exception as e:
-        logger.error(f'❌ Error syncing commands: {e}')
-
+    # Sync commands with retry
+    for attempt in range(3):
+        try:
+            synced = await bot.tree.sync()
+            logger.info(f'✅ Synced {len(synced)} commands')
+            break
+        except discord.HTTPException as e:
+            if e.status == 429:
+                wait = 30 * (attempt + 1)
+                logger.warning(f'Rate limited syncing, waiting {wait}s')
+                await asyncio.sleep(wait)
+            else:
+                logger.error(f'Sync error: {e}')
+                break
+    
+    bot_ready = True
+    logger.info('✅ Bot is fully ready!')
+    logger.info('🔐 Verification system active')
+    logger.info('🛡️  Anti-raid protection enabled')
 
 # ===== MAIN FUNCTION =====
 async def main():
-    """Main function with auto-recovery"""
-    max_retries = 5
-    retry_count = 0
+    """Main function with rate limit handling"""
     
-    while retry_count < max_retries:
+    # Start web server FIRST
+    logger.info('🚀 Starting web server...')
+    await start_web_server()
+    logger.info('✅ Web server running!')
+    
+    # Connect bot with exponential backoff
+    max_retries = 10
+    for retry in range(max_retries):
         try:
+            if retry > 0:
+                wait = min(60 * (2 ** retry), 1800)  # Max 30 min
+                logger.info(f'⏳ Waiting {wait}s before retry {retry + 1}/{max_retries}')
+                logger.info(f'⏰ Will retry at: {datetime.now() + timedelta(seconds=wait)}')
+                await asyncio.sleep(wait)
+            
+            logger.info(f'🔌 Connecting to Discord (attempt {retry + 1}/{max_retries})...')
             await bot.start(BOT_TOKEN)
-        except discord.errors.HTTPException as e:
+            
+        except discord.LoginFailure:
+            logger.error('❌ Invalid token! Check BOT_TOKEN')
+            break
+        except discord.HTTPException as e:
             if e.status == 429:
-                logger.error(f'❌ Rate limited! Waiting before retry...')
-                wait_time = min(300, 60 * (retry_count + 1))
-                await asyncio.sleep(wait_time)
-            retry_count += 1
+                retry_after = float(e.response.headers.get('Retry-After', 60))
+                logger.error(f'❌ Rate limited! Discord says retry after {retry_after}s')
+                await asyncio.sleep(retry_after + 60)
+            else:
+                logger.error(f'HTTP error: {e}')
+                await asyncio.sleep(30)
         except Exception as e:
-            retry_count += 1
-            wait_time = min(60 * retry_count, 300)
-            logger.error(f'❌ Bot crashed! Retry {retry_count}/{max_retries} in {wait_time}s')
             logger.error(f'Error: {e}')
-            await asyncio.sleep(wait_time)
+            await asyncio.sleep(30)
     
-    logger.error('💀 Max retries reached. Bot stopped.')
+    logger.error('❌ Max retries reached')
+    logger.info('⚠️  Web server still running for health checks')
+    
+    # Keep alive
+    while True:
+        await asyncio.sleep(3600)
 
-
-# ===== RUN BOT =====
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info('⛔ Bot stopped by user')
-    except Exception as e:
-        logger.error(f'💥 Fatal error: {e}')
+        logger.info('⛔ Stopped by user')
