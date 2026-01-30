@@ -129,46 +129,83 @@ async def setup(interaction: discord.Interaction):
 async def handle_callback(request):
     code = request.query.get("code")
     if not code:
+        logger.warning("Callback received without code")
         return web.Response(text="No code provided.", status=400)
 
-    async with aiohttp.ClientSession() as session:
-        # Exchange code for token
-        data = {
-            'client_id': CLIENT_ID,
-            'client_secret': CLIENT_SECRET,
-            'grant_type': 'authorization_code',
-            'code': code,
-            'redirect_uri': REDIRECT_URI
-        }
-        async with session.post("https://discord.com/api/oauth2/token", data=data) as resp:
-            token_data = await resp.json()
+    try:
+        # Use context manager - automatically closes session
+        async with aiohttp.ClientSession() as session:
+            # Exchange code for token
+            data = {
+                'client_id': CLIENT_ID,
+                'client_secret': CLIENT_SECRET,
+                'grant_type': 'authorization_code',
+                'code': code,
+                'redirect_uri': REDIRECT_URI
+            }
+            
+            async with session.post("https://discord.com/api/oauth2/token", data=data) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"Token exchange failed: {resp.status} - {error_text}")
+                    return web.Response(text="OAuth failed. Please try again.", status=400)
+                token_data = await resp.json()
 
-        access_token = token_data.get("access_token")
-        if not access_token:
-            return web.Response(text="OAuth failed.", status=400)
+            access_token = token_data.get("access_token")
+            if not access_token:
+                logger.error("No access token in response")
+                return web.Response(text="OAuth failed.", status=400)
 
-        async with session.get(
-            "https://discord.com/api/users/@me",
-            headers={"Authorization": f"Bearer {access_token}"}
-        ) as resp:
-            user = await resp.json()
+            async with session.get(
+                "https://discord.com/api/users/@me",
+                headers={"Authorization": f"Bearer {access_token}"}
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"User fetch failed: {resp.status} - {error_text}")
+                    return web.Response(text="Failed to fetch user info.", status=400)
+                user = await resp.json()
 
-    user_id = int(user["id"])
+        # Session automatically closed here
 
-    if user_id not in pending_verifications:
-        return web.Response(text="Verification expired.", status=400)
+        user_id = int(user["id"])
+        logger.info(f"Processing verification for user {user_id}")
 
-    guild = bot.get_guild(pending_verifications[user_id]["guild_id"])
-    member = guild.get_member(user_id)
+        if user_id not in pending_verifications:
+            logger.warning(f"Verification expired for user {user_id}")
+            return web.Response(text="Verification expired or not initiated. Please try again.", status=400)
 
-    verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
-    if not verified_role:
-        verified_role = await guild.create_role(name=VERIFIED_ROLE_NAME)
+        guild = bot.get_guild(pending_verifications[user_id]["guild_id"])
+        if not guild:
+            logger.error(f"Guild not found for user {user_id}")
+            return web.Response(text="Server not found.", status=400)
+            
+        member = guild.get_member(user_id)
+        if not member:
+            logger.error(f"Member {user_id} not found in guild {guild.id}")
+            return web.Response(text="You are not a member of this server.", status=400)
 
-    await member.add_roles(verified_role)
-    del pending_verifications[user_id]
+        verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+        if not verified_role:
+            logger.info(f"Creating verified role in guild {guild.id}")
+            verified_role = await guild.create_role(name=VERIFIED_ROLE_NAME)
 
-    return web.Response(text="✅ Verification successful! You may close this tab.")
+        await member.add_roles(verified_role)
+        logger.info(f"✅ User {user_id} verified successfully in guild {guild.id}")
+        
+        del pending_verifications[user_id]
+
+        return web.Response(text="✅ Verification successful! You may close this tab.")
+        
+    except aiohttp.ClientError as e:
+        logger.error(f"HTTP request error during verification: {e}", exc_info=True)
+        return web.Response(text="Network error occurred. Please try again.", status=500)
+    except discord.errors.Forbidden as e:
+        logger.error(f"Permission error: {e}", exc_info=True)
+        return web.Response(text="Bot lacks permissions to assign roles.", status=500)
+    except Exception as e:
+        logger.error(f"Unexpected verification error: {e}", exc_info=True)
+        return web.Response(text="An error occurred during verification. Please contact an administrator.", status=500)
 
 # ===== HEALTH CHECK =====
 async def handle_health(request):
@@ -192,8 +229,18 @@ async def start_web_server():
 
 # ===== MAIN =====
 async def main():
-    await start_web_server()
-    await bot.start(BOT_TOKEN)
+    try:
+        await start_web_server()
+        await bot.start(BOT_TOKEN)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+    finally:
+        await bot.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
