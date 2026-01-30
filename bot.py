@@ -211,7 +211,7 @@ async def handle_callback(request):
 async def handle_health(request):
     return web.json_response({
         "status": "ready" if bot_ready else "starting",
-        "guilds": len(bot.guilds),
+        "guilds": len(bot.guilds) if bot_ready else 0,
         "latency": round(bot.latency * 1000) if bot_ready else 0
     })
 
@@ -227,17 +227,53 @@ async def start_web_server():
     await site.start()
     logger.info(f"🌐 Web server running on port {PORT}")
 
+# ===== RATE LIMIT HANDLER =====
+async def start_bot_with_retry():
+    """Start bot with exponential backoff on rate limits"""
+    max_retries = 5
+    base_delay = 30  # Start with 30 seconds
+    
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to start bot (attempt {attempt + 1}/{max_retries})")
+            await bot.start(BOT_TOKEN)
+            return  # Success
+        except discord.errors.HTTPException as e:
+            if e.status == 429:  # Rate limited
+                if attempt < max_retries - 1:
+                    # Calculate delay with exponential backoff
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(f"⏳ Rate limited. Waiting {delay} seconds before retry...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error("❌ Max retries reached. Rate limit persists.")
+                    raise
+            else:
+                raise  # Re-raise if it's not a rate limit error
+        except Exception as e:
+            logger.error(f"Unexpected error starting bot: {e}")
+            raise
+
 # ===== MAIN =====
 async def main():
     try:
+        # Start web server first (so health checks work during rate limit waits)
         await start_web_server()
-        await bot.start(BOT_TOKEN)
+        
+        # Start bot with retry logic
+        await start_bot_with_retry()
+        
+    except discord.errors.LoginFailure:
+        logger.error("❌ Invalid bot token. Please check your BOT_TOKEN environment variable.")
+        exit(1)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
+        exit(1)
     finally:
-        await bot.close()
+        if not bot.is_closed():
+            await bot.close()
 
 if __name__ == "__main__":
     try:
